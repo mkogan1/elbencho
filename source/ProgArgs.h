@@ -213,6 +213,7 @@ namespace bpt = boost::property_tree;
 #define ARG_SVCUPDATEINTERVAL_LONG       "svcupint"
 #define ARG_SVCREADYWAITSECS_LONG        "svcwait"
 #define ARG_SYNCPHASE_LONG               "sync"
+#define ARG_THRDELAY_LONG                "thrdelay"
 #define ARG_TIMELIMITSECS_LONG           "timelimit"
 #define ARG_TREEFILE_LONG                "treefile"
 #define ARG_TREERANDOMIZE_LONG           "treerand"
@@ -554,6 +555,8 @@ class ProgArgs
             (useful for directIO with its alignment reqs on some file systems. 0 disables this.) */
         std::string treeRoundUpSizeOrigStr; // original treeRoundUpSize str from user with unit
         std::string treeScanPath; // path to dir/bucket to scan as custom tree
+        unsigned thrStartDelayMS; /* max random per-thread startup delay in ms before each phase
+            (0 disables) */
         size_t timeLimitSecs; // time limit in seconds for each phase (0 to disable)
         bool useAlternativeHTTPService; // use alternative http service implememtation
         bool useBriefLiveStats; // single-line live stats
@@ -856,6 +859,7 @@ class ProgArgs
         bool getUseS3SSE() const { return useS3SSE; }
         bool getUseS3VirtualAddressing() const { return useS3VirtualAddressing; }
         bool getUseStridedAccess() const { return useStridedAccess; }
+        unsigned getThrStartDelayMS() const { return thrStartDelayMS; }
         size_t getTimeLimitSecs() const { return timeLimitSecs; }
         std::string getTreeFilePath() const { return treeFilePath; }
         uint64_t getTreeRoundUpSize() const { return treeRoundUpSize; }

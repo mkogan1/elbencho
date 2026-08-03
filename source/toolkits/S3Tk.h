@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2020-2025 Sven Breuner and elbencho contributors
+// SPDX-FileCopyrightText: 2020-2026 Sven Breuner and elbencho contributors
 // SPDX-License-Identifier: GPL-3.0-only
 
 #ifndef TOOLKITS_S3TK_H_
@@ -8,14 +8,19 @@
 #include "workers/WorkerException.h"
 
 #ifdef S3_SUPPORT
+	#include <atomic>
+	#include <cstring>
+	#include <streambuf>
+
 	#include <aws/core/Aws.h>
     #include <aws/core/client/ClientConfiguration.h>
     #include <aws/core/utils/HashingUtils.h>
 	#include <aws/core/utils/memory/AWSMemory.h>
 	#include <aws/core/utils/memory/stl/AWSStreamFwd.h>
-	#include <aws/core/utils/stream/PreallocatedStreamBuf.h>
     #include <aws/core/VersionConfig.h>
 	#include INCLUDE_AWS_S3(model/CompleteMultipartUploadRequest.h)
+
+	#include "toolkits/RateLimiter.h"
 
     #ifdef S3_AWSCRT
         #include INCLUDE_AWS_S3(S3CrtClient.h)
@@ -52,16 +57,221 @@
     #define AWS_SDK_AT_LEAST(req_maj, req_min, req_pat) \
         (AWS_CURRENT_VER_VAL >= AWS_VER_CALC(req_maj, req_min, req_pat))
 
+	/**
+	 * In-memory streambuf for S3 upload bodies. Optionally paces reads via RateLimiter in 64 KiB
+	 * chunks so --limitwrite shapes wire traffic during a part, not only between parts.
+	 */
+	class S3PacedStreamBuf : public std::streambuf
+	{
+		public:
+			static constexpr size_t PACE_CHUNK_SIZE = 64 * 1024;
+
+			S3PacedStreamBuf(unsigned char* buf, uint64_t bufLen,
+				RateLimiter* rateLimiter = nullptr,
+				std::atomic_bool* isInterruptionRequested = nullptr) :
+				bufBegin( (char*)buf),
+				bufEnd( (char*)buf + bufLen),
+				cursorPos( (char*)buf),
+				dataSize(bufLen),
+				rateLimiter(rateLimiter),
+				isInterruptionRequested(isInterruptionRequested)
+			{
+				// empty get/put areas; underflow/xsgetn and xsputn/overflow handle data transfers
+				setg(nullptr, nullptr, nullptr);
+				setp(nullptr, nullptr);
+			}
+
+		protected:
+			char* dataEndPtr() const
+			{
+				char* ptr = bufBegin + dataSize;
+				return (ptr < bufEnd) ? ptr : bufEnd;
+			}
+
+			bool paceAndWait(size_t chunk)
+			{
+				IF_UNLIKELY(!rateLimiter || !chunk)
+					return true;
+
+				std::atomic_bool dummyInterrupt{false};
+				std::atomic_bool& interruptFlag = isInterruptionRequested ?
+					*isInterruptionRequested : dummyInterrupt;
+				bool interrupted = false;
+
+				rateLimiter->wait(chunk, interruptFlag, interrupted);
+				return !interrupted;
+			}
+
+			std::streamsize xsgetn(char* dest, std::streamsize n) override
+			{
+				IF_UNLIKELY(n <= 0 || !dest)
+					return 0;
+
+				std::streamsize totalCopied = 0;
+
+				// drain already-paced get area first
+				if(gptr() && gptr() < egptr() )
+				{
+					const std::streamsize avail = egptr() - gptr();
+					const std::streamsize take = (avail < n) ? avail : n;
+					std::memcpy(dest, gptr(), (size_t)take);
+					gbump( (int)take);
+					totalCopied += take;
+				}
+
+				while(totalCopied < n && cursorPos < dataEndPtr() )
+				{
+					size_t remainingInBuf = (size_t)(dataEndPtr() - cursorPos);
+					size_t remainingRequest = (size_t)(n - totalCopied);
+					size_t chunk = remainingInBuf < remainingRequest ?
+						remainingInBuf : remainingRequest;
+
+					if(rateLimiter && chunk > PACE_CHUNK_SIZE)
+						chunk = PACE_CHUNK_SIZE;
+
+					IF_UNLIKELY(!paceAndWait(chunk) )
+						return totalCopied; // short read; HTTP continue-handler also aborts
+
+					std::memcpy(dest + totalCopied, cursorPos, chunk);
+					cursorPos += chunk;
+					totalCopied += (std::streamsize)chunk;
+				}
+
+				return totalCopied;
+			}
+
+			int_type underflow() override
+			{
+				if(gptr() && gptr() < egptr() )
+					return traits_type::to_int_type(*gptr() );
+
+				if(cursorPos >= dataEndPtr() )
+					return traits_type::eof();
+
+				// deliver one paced chunk via get area pointing into the source buffer
+				size_t remainingInBuf = (size_t)(dataEndPtr() - cursorPos);
+				size_t chunk = remainingInBuf;
+
+				if(rateLimiter && chunk > PACE_CHUNK_SIZE)
+					chunk = PACE_CHUNK_SIZE;
+
+				IF_UNLIKELY(!paceAndWait(chunk) )
+					return traits_type::eof();
+
+				char* chunkEnd = cursorPos + chunk;
+				setg(cursorPos, cursorPos, chunkEnd);
+				cursorPos = chunkEnd;
+
+				return traits_type::to_int_type(*gptr() );
+			}
+
+			std::streamsize xsputn(const char* src, std::streamsize n) override
+			{
+				IF_UNLIKELY(n <= 0 || !src)
+					return 0;
+
+				if(cursorPos >= bufEnd)
+					return 0;
+
+				const std::streamsize writable = bufEnd - cursorPos;
+				const std::streamsize toWrite = (n < writable) ? n : writable;
+
+				std::memcpy(cursorPos, src, (size_t)toWrite);
+				cursorPos += toWrite;
+
+				if(cursorPos > dataEndPtr() )
+					dataSize = (size_t)(cursorPos - bufBegin);
+
+				return toWrite;
+			}
+
+			int_type overflow(int_type ch = traits_type::eof() ) override
+			{
+				if(traits_type::eq_int_type(ch, traits_type::eof() ) )
+					return traits_type::not_eof(ch);
+
+				if(cursorPos >= bufEnd)
+					return traits_type::eof();
+
+				*cursorPos = traits_type::to_char_type(ch);
+				cursorPos++;
+
+				if(cursorPos > dataEndPtr() )
+					dataSize = (size_t)(cursorPos - bufBegin);
+
+				return ch;
+			}
+
+			pos_type seekoff(off_type off, std::ios_base::seekdir dir,
+				std::ios_base::openmode which = std::ios_base::in | std::ios_base::out) override
+			{
+				if( !(which & (std::ios_base::in | std::ios_base::out) ) )
+					return pos_type(off_type(-1) );
+
+				char* newPos = nullptr;
+
+				switch(dir)
+				{
+					case std::ios_base::beg:
+						newPos = bufBegin + off;
+						break;
+					case std::ios_base::cur:
+					{
+						// prefer logical position: if get area active use gptr, else bufPos
+						char* cur = (gptr() && gptr() >= eback() && gptr() <= egptr() ) ?
+							gptr() : cursorPos;
+						newPos = cur + off;
+					} break;
+					case std::ios_base::end:
+						newPos = ( (which & std::ios_base::out) ? bufEnd : dataEndPtr() ) + off;
+						break;
+					default:
+						return pos_type(off_type(-1) );
+				}
+
+				if(newPos < bufBegin || newPos > bufEnd)
+					return pos_type(off_type(-1) );
+
+				cursorPos = newPos;
+				setg(nullptr, nullptr, nullptr);
+				return pos_type(newPos - bufBegin);
+			}
+
+			pos_type seekpos(pos_type pos,
+				std::ios_base::openmode which = std::ios_base::in | std::ios_base::out) override
+			{
+				return seekoff(off_type(pos), std::ios_base::beg, which);
+			}
+
+			std::streamsize showmanyc() override
+			{
+				char* endPtr = dataEndPtr();
+				return (cursorPos < endPtr) ? (std::streamsize)(endPtr - cursorPos) : 0;
+			}
+
+		private:
+			char* bufBegin;
+			char* bufEnd;
+			char* cursorPos; // current read/write cursor
+			size_t dataSize; // initialized readable size, extended by writes
+			RateLimiter* rateLimiter;
+			std::atomic_bool* isInterruptionRequested;
+	};
 
     /**
      * Aws::IOStream derived in-memory stream implementation for S3 object upload/download. The
      * actual in-memory part comes from the streambuf that gets provided to the constructor.
+	 *
+	 * Optional RateLimiter paces body reads during upload for mid-transfer --limitwrite shaping.
      */
     class S3MemoryStream : public Aws::IOStream
     {
         public:
-            S3MemoryStream(unsigned char* buf, uint64_t bufLen) :
-                Aws::IOStream(&staticZeroStreamBuf), streamBuf(buf, bufLen)
+            S3MemoryStream(unsigned char* buf, uint64_t bufLen,
+				RateLimiter* rateLimiter = nullptr,
+				std::atomic_bool* isInterruptionRequested = nullptr) :
+                Aws::IOStream(&staticZeroStreamBuf),
+				streamBuf(buf, bufLen, rateLimiter, isInterruptionRequested)
             {
                 /* staticZeroStreamBuf was only because base class needs to be init'ed before our
                     streamBuf, so immediately replace with actual streamBuf now that it's ready */
@@ -75,7 +285,7 @@
                 init of std::iostream because that needs to be done before streamBuf init, but
                 will be replaced immediately after streamBuf is initialized */
 
-            Aws::Utils::Stream::PreallocatedStreamBuf streamBuf;
+			S3PacedStreamBuf streamBuf;
     };
 
 
@@ -137,6 +347,7 @@ class S3Tk
             if(s3ChecksumAlgorithm == S3ChecksumAlgorithm::NOT_SET)
                 return; // nothing to do
 
+			// unmetered stream: checksum must not sleep under --limitwrite
             S3MemoryStream memStream(buf, bufLen);
 
             switch(s3ChecksumAlgorithm)

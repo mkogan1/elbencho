@@ -158,6 +158,8 @@ class LocalWorker : public Worker
         std::string s3SSECKeyMD5; // SSE-C encryption key MD5 hash
         std::string s3SSEKMSKey; // SSE-KMS encryption key
 		S3ChecksumAlgorithm s3ChecksumAlgorithm; // for x-amz-sdk-checksum-algorithm header
+		bool useS3UploadStreamRateLimit{false}; /* mid-transfer --limitwrite via paced upload
+			body stream; skips pre-part rate wait for S3 uploads */
 #endif
 
 #ifdef HDFS_SUPPORT
@@ -185,6 +187,7 @@ class LocalWorker : public Worker
 
 		void preparePhase();
 		void finishPhase();
+		void applyThreadStartDelay();
 
         void initLibAio();
         void uninitLibAio();
@@ -234,6 +237,9 @@ class LocalWorker : public Worker
 		void s3ModeIterateObjectsRand();
 		void s3ModeIterateCustomObjects();
         void s3ModeIterateAndCompleteMpuIDs();
+#ifdef S3_SUPPORT
+		std::shared_ptr<Aws::IOStream> makeS3UploadBodyStream(unsigned char* buf, size_t len);
+#endif
 
 #ifdef S3_SUPPORT
         template <typename R>

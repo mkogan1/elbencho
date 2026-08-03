@@ -19,6 +19,8 @@ All options in alphabetical order:
                           object size is larger than this block size. (Default:
                           1M; supports base2 suffixes, e.g. "128K")
   --backward              Do backwards sequential reads/writes.
+  --base10                Show throughput in base10 instead of base2 numbers 
+                          (e.g. MB/s instead of MiB/s).
   --blockvaralgo arg      Random number algorithm for "--blockvarpct". Values: 
                           "fast" for high speed but weaker randomness; 
                           "balanced" for good balance of speed and randomness; 
@@ -54,12 +56,6 @@ All options in alphabetical order:
                           "--livecsv" for progress results in csv format.) 
                           (Default: Store in "/var/tmp" under a subdir that 
                           contains the username.)
-  --cufile                Use cuFile API for reads/writes to/from GPU memory, 
-                          also known as GPUDirect Storage (GDS).
-  --cufiledriveropen      Explicitly initialize cuFile lib and open the 
-                          nvida-fs driver.
-  --cuhostbufreg          Pin host memory buffers and register with CUDA for 
-                          faster transfer to/from GPU.
   -D [ --deldirs ]        Delete directories.
   -d [ --mkdirs ]         Create directories. (Already existing dirs are not 
                           treated as error.)
@@ -102,25 +98,6 @@ All options in alphabetical order:
   --foreground            When running as service, stay in foreground and 
                           connected to console instead of detaching from 
                           console and daemonizing into background.
-  --gds                   Use Nvidia GPUDirect Storage API. Enables "--direct",
-                          "--cufile", "--gdsbufreg".
-  --gdsbufreg             Register GPU buffers for GPUDirect Storage (GDS) when
-                          using cuFile API.
-  --gpuids arg            Comma-separated list of CUDA GPU IDs to use for 
-                          buffer allocation. If no other option for GPU buffers
-                          is given then read/write timings will include copy 
-                          to/from GPU buffers. GPU IDs will be assigned round 
-                          robin to different threads. When this is given in 
-                          service mode then the given list will override any 
-                          list given by the master, which can be used to bind 
-                          specific service instances to specific GPUs. The 
-                          special value "all" is short for the list of all 
-                          available GPUs. (Hint: CUDA GPU IDs are 0-based; see 
-                          'nvidia-smi' for available GPU IDs.)
-  --gpuperservice         Assign GPUs round robin to service instances (i.e. 
-                          one GPU per service) instead of default round robin 
-                          to threads (i.e. multiple GPUs per service, if 
-                          multiple given).
   --hosts arg             List of hosts in service mode (separated by comma, 
                           space, or newline) for coordinated benchmark. When 
                           this argument is used, this program instance runs in 
@@ -159,10 +136,15 @@ All options in alphabetical order:
   --latpercent9s arg      Number of decimal nines to show in latency 
                           percentiles. 0 for 99%, 1 for 99.9%, 2 for 99.99% and
                           so on. (Default: 0)
-  --limitread arg         Per-thread read limit in bytes per second.
-  --limitwrite arg        Per-thread write limit in bytes per second. (In 
-                          combination with "--rwmixpct" this defines the limit 
-                          for read+write.)
+  --limitread arg         Per-thread read limit in bytes per second. Paced as 
+                          average throughput, including when block size exceeds
+                          the limit.
+  --limitwrite arg        Per-thread write limit in bytes per second. Paced as 
+                          average throughput, including when block size exceeds
+                          the limit. For S3 uploads, traffic is shaped during 
+                          transfer (not only between parts). (In combination 
+                          with "--rwmixpct" this defines the limit for 
+                          read+write.)
   --live1                 Use brief live statistics format, i.e. a single line 
                           instead of full screen stats. The line gets updated 
                           in-place.
@@ -384,6 +366,9 @@ All options in alphabetical order:
                           (Default: Number of threads sharing the instance 
                           times iodepth.) [Not effective for builds with 
                           feature s3crt.]
+  --s3mpusharing          Use shared multipart upload mode for S3 objects from 
+                          multiple clients. For this mode, object names need to
+                          be given as parameters (e.g. "mybucket/myobj[1-10]").
   --s3mpusizevar arg      Maximum number of bytes to subtract from part size of
                           multipart uploads for random variance in part sizes. 
                           The last uploaded part will be correspondingly larger
@@ -506,6 +491,11 @@ All options in alphabetical order:
   --sync                  Sync Linux kernel page cache to stable storage 
                           before/after each phase.
   -t [ --threads ] arg    Number of I/O worker threads. (Default: 1)
+  --thrdelay arg          Max random per-thread startup delay in milliseconds 
+                          before each benchmark phase. Each worker sleeps a 
+                          random time in [0, arg] after phase start 
+                          notification to avoid synchronized waves of identical
+                          requests. (Default: 0)
   --timelimit arg         Time limit in seconds for each benchmark phase. If 
                           the limit is exceeded for a phase then no further 
                           phases will run. (Default: 0 for disabled)
@@ -522,9 +512,14 @@ All options in alphabetical order:
                           treefile. (Note: The file list will be split across 
                           worker threads, but dir create/delete is not fully 
                           parallel, so don't use this for dir create/delete 
-                          performance testing.)
+                          performance testing.) (Note: In this mode, the 
+                          write/read phase files counter only counts files that
+                          have not been split across multiple workers.)
   --treerand              In custom tree mode: Randomize file order. Default is
                           order by file size.
+  --treeroundrob          In custom tree mode: Assign file blocks round-robin 
+                          to workers. Default is to maximize consecutive ranges
+                          per worker.
   --treeroundup arg       When loading a treefile, round up all contained file 
                           sizes to a multiple of the given size. This is useful
                           for "--direct" with its alignment requirements on 

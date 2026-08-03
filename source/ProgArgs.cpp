@@ -409,9 +409,12 @@ void ProgArgs::defineAllowedArgs()
 			"Number of decimal nines to show in latency percentiles. 0 for 99%, 1 for 99.9%, 2 for "
 			"99.99% and so on. (Default: 0)")
 /*li*/	(ARG_LIMITREAD_LONG, bpo::value(&this->limitReadBpsOrigStr),
-			"Per-thread read limit in bytes per second.")
+			"Per-thread read limit in bytes per second. Paced as average throughput, including when "
+			"block size exceeds the limit.")
 /*li*/	(ARG_LIMITWRITE_LONG, bpo::value(&this->limitWriteBpsOrigStr),
-			"Per-thread write limit in bytes per second. (In combination with "
+			"Per-thread write limit in bytes per second. Paced as average throughput, including "
+			"when block size exceeds the limit. For S3 uploads, traffic is shaped during transfer "
+			"(not only between parts). (In combination with "
 			"\"--" ARG_RWMIXPERCENT_LONG "\" this defines the limit for read+write.)")
 /*liv*/	(ARG_BRIEFLIVESTATS_LONG, bpo::bool_switch(&this->useBriefLiveStats),
 			"Use brief live statistics format, i.e. a single line instead of full screen stats. "
@@ -793,6 +796,10 @@ void ProgArgs::defineAllowedArgs()
 			"Sync Linux kernel page cache to stable storage before/after each phase.")
 /*t*/	(ARG_NUMTHREADS_LONG "," ARG_NUMTHREADS_SHORT, bpo::value(&this->numThreads),
 			"Number of I/O worker threads. (Default: 1)")
+/*th*/	(ARG_THRDELAY_LONG, bpo::value(&this->thrStartDelayMS),
+			"Max random per-thread startup delay in milliseconds before each benchmark phase. "
+			"Each worker sleeps a random time in [0, arg] after phase start notification to avoid "
+			"synchronized waves of identical requests. (Default: 0)")
 /*ti*/	(ARG_TIMELIMITSECS_LONG, bpo::value(&this->timeLimitSecs),
 			"Time limit in seconds for each benchmark phase. If the limit is exceeded for a phase "
 			"then no further phases will run. (Default: 0 for disabled)")
@@ -992,6 +999,7 @@ void ProgArgs::defineDefaults()
     this->svcReadyWaitSec = 5;
     this->svcShowPing = false;
     this->svcUpdateIntervalMS = 500;
+    this->thrStartDelayMS = 0;
     this->timeLimitSecs = 0;
     this->useAlternativeHTTPService = false;
     this->useRWMixPercent = false;
@@ -3848,6 +3856,7 @@ void ProgArgs::setFromPropertyTreeForService(bpt::ptree& tree)
     showThroughputBase10 = tree.get<bool>(ARG_THROUGHPUTBASE10_LONG);
 	sockRecvBufSize = tree.get<int>(ARG_RECVBUFSIZE_LONG);
 	sockSendBufSize = tree.get<int>(ARG_SENDBUFSIZE_LONG);
+	thrStartDelayMS = tree.get<unsigned>(ARG_THRDELAY_LONG);
 	treeRoundUpSize = tree.get<uint64_t>(ARG_TREEROUNDUP_LONG);
 	useCuFile = tree.get<bool>(ARG_CUFILE_LONG);
 	useCuFileDriverOpen = tree.get<bool>(ARG_CUFILEDRIVEROPEN_LONG);
@@ -4031,6 +4040,7 @@ void ProgArgs::getAsPropertyTreeForService(bpt::ptree& outTree, size_t serviceRa
     outTree.put(ARG_STATFILESINLINE_LONG, doStatInline);
     outTree.put(ARG_STRIDEDACCESS_LONG, useStridedAccess);
     outTree.put(ARG_SYNCPHASE_LONG, runSyncPhase);
+	outTree.put(ARG_THRDELAY_LONG, thrStartDelayMS);
     outTree.put(ARG_THROUGHPUTBASE10_LONG, showThroughputBase10);
 	outTree.put(ARG_TRUNCATE_LONG, doTruncate);
 	outTree.put(ARG_TRUNCTOSIZE_LONG, doTruncToSize);

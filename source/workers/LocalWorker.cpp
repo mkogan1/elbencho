@@ -7,6 +7,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <thread>
 
 #include "Common.h"
 #include "LocalWorker.h"
@@ -14,6 +15,7 @@
 #include "PathStore.h"
 #include "toolkits/FileTk.h"
 #include "toolkits/random/RandAlgoSelectorTk.h"
+#include "toolkits/random/RandAlgoXoshiro256ss.h"
 #include "toolkits/S3Tk.h"
 #include "toolkits/StringTk.h"
 #include "toolkits/TranslatorTk.h"
@@ -184,6 +186,38 @@ LocalWorker::~LocalWorker()
 
 
 /**
+ * Sleep a random time in [0, --thrdelay] ms once after phase start notification.
+ * Skipped for TERMINATE or when thrdelay is 0. Interruptible for friendly shutdown.
+ */
+void LocalWorker::applyThreadStartDelay()
+{
+	const unsigned maxDelayMS = progArgs->getThrStartDelayMS();
+	if(!maxDelayMS)
+		return;
+
+	if(workersSharedData->currentBenchPhase == BenchPhase_TERMINATE)
+		return;
+
+	RandAlgoXoshiro256ss randGen;
+	const uint64_t delayMS = (randGen.next() ^ (uint64_t)workerRank) % ( (uint64_t)maxDelayMS + 1);
+
+	LOGGER(Log_DEBUG, "Thread start delay. Rank: " << workerRank << "; "
+		"DelayMS: " << delayMS << "; MaxMS: " << maxDelayMS << std::endl);
+
+	const unsigned sliceMS = 50;
+	uint64_t remainingMS = delayMS;
+
+	while(remainingMS)
+	{
+		checkInterruptionRequest();
+
+		const unsigned thisSliceMS = (remainingMS > sliceMS) ? sliceMS : (unsigned)remainingMS;
+		std::this_thread::sleep_for(std::chrono::milliseconds(thisSliceMS) );
+		remainingMS -= thisSliceMS;
+	}
+}
+
+/**
  * Entry point for the thread.
  * Kick off the work that this worker has to do. Each phase is sychronized to wait for notification
  * by coordinator.
@@ -210,6 +244,9 @@ void LocalWorker::run()
 
 			currentBenchID = workersSharedData->currentBenchID;
 			bool doInfiniteIOLoop = progArgs->getDoInfiniteIOLoop();
+
+			// stagger workers after phase sync so equal-sized work does not stay in lockstep
+			applyThreadStartDelay();
 
 			do // for infinite I/O loop
 			{
@@ -1202,6 +1239,9 @@ void LocalWorker::nullifyPhaseFunctionPointers()
 	funcCuFileHandleReg = NULL;
 	funcCuFileHandleDereg = NULL;
 	funcRWRateLimiter = NULL;
+#ifdef S3_SUPPORT
+	useS3UploadStreamRateLimit = false;
+#endif
 }
 
 /**
@@ -1305,6 +1345,10 @@ void LocalWorker::initPhaseFunctionPointers()
 
 	    // rate limiter / balancer
 
+#ifdef S3_SUPPORT
+		useS3UploadStreamRateLimit = false;
+#endif
+
         if(numRWMixReadThreads && rwMixThreadsReadPercent)
         { // rate balancer between reader and writer threads
             rateLimiterRWMixThreads.initStart(
@@ -1317,6 +1361,10 @@ void LocalWorker::initPhaseFunctionPointers()
         { // plain per-thread rate limiter
             funcRWRateLimiter = &LocalWorker::preRWRateLimiter;
             rateLimiter.initStart(perThreadWriteRateLimitBps);
+#ifdef S3_SUPPORT
+			// S3 uploads meter in the body stream instead of waiting for the whole part first
+			useS3UploadStreamRateLimit = true;
+#endif
         }
         else // no rate limit
             funcRWRateLimiter = &LocalWorker::noOpRateLimiter;
@@ -2403,10 +2451,17 @@ bool LocalWorker::noOpRateLimiter(size_t rwSize, std::atomic_bool& isInterruptio
  * Rate limiter before writes/reads in case rate limit was selected by user.
  *
  * @return true if we had to wait, false if we are good to go immediately.
+ * @throw WorkerInterruptedException if friendly interrupt was requested during a long wait.
  */
 bool LocalWorker::preRWRateLimiter(size_t rwSize, std::atomic_bool& isInterruptionRequested)
 {
-    return rateLimiter.wait(rwSize);
+	bool interrupted = false;
+	const bool hadToWait = rateLimiter.wait(rwSize, isInterruptionRequested, interrupted);
+
+	IF_UNLIKELY(interrupted)
+		throw WorkerInterruptedException("Received friendly request to interrupt execution.");
+
+	return hadToWait;
 }
 
 /**
@@ -4800,6 +4855,21 @@ void LocalWorker::s3ModePutBucketVersioning(const std::string& bucketName, bool 
 #endif // S3_SUPPORT
 }
 
+#ifdef S3_SUPPORT
+/**
+ * Build S3 upload body stream. When --limitwrite mid-transfer shaping is active, attaches this
+ * worker's RateLimiter so the SDK's body reads are paced in 64 KiB chunks.
+ */
+std::shared_ptr<Aws::IOStream> LocalWorker::makeS3UploadBodyStream(unsigned char* buf, size_t len)
+{
+	if(useS3UploadStreamRateLimit)
+		return std::make_shared<S3MemoryStream>(
+			buf, len, &rateLimiter, &isInterruptionRequested);
+
+	return std::make_shared<S3MemoryStream>(buf, len);
+}
+#endif // S3_SUPPORT
+
 /**
  * Singlepart upload of an S3 object to an existing bucket. This assumes that progArgs fileSize
  * is not larger than blockSize. Or in other words: This can only upload objects consisting of a
@@ -4822,10 +4892,12 @@ void LocalWorker::s3ModeUploadObjectSinglePart(std::string bucketName, std::stri
 
     if(blockSize)
     {
-        s3MemStream = std::make_shared<S3MemoryStream>(
+        s3MemStream = makeS3UploadBodyStream(
             (unsigned char*) (blockSize ? ioBufVec[0] : NULL), blockSize);
 
-        ((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
+		// mid-transfer shaping paces inside the stream; avoid double-counting the whole part
+		if(!useS3UploadStreamRateLimit)
+			((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
     }
 
 	std::chrono::steady_clock::time_point ioStartT = std::chrono::steady_clock::now();
@@ -4980,10 +5052,11 @@ void LocalWorker::s3ModeUploadObjectMultiPart(std::string bucketName, std::strin
         /* note: streamBuf (member of S3MemoryStream) needs to be initialized in loop to
             have the exact remaining blockSize as len. otherwise the AWS SDK will send full
             streamBuf len despite smaller contentLength in UploadPartRequest. */
-        std::shared_ptr<Aws::IOStream> s3MemStream = std::make_shared<S3MemoryStream>(
+        std::shared_ptr<Aws::IOStream> s3MemStream = makeS3UploadBodyStream(
             (unsigned char*) ioBufVec[0], blockSize);
 
-		((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
+		if(!useS3UploadStreamRateLimit)
+			((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
 
 		std::chrono::steady_clock::time_point ioStartT = std::chrono::steady_clock::now();
 
@@ -5219,7 +5292,8 @@ void LocalWorker::s3ModeUploadObjectMultiPartAsync(std::string bucketName, std::
                 const uint64_t currentPartNum =
                     1 + (currentOffset / rwOffsetGen->getBlockSize() ); // +1 for 1-based part range
 
-                ((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
+                if(!useS3UploadStreamRateLimit)
+                    ((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
 
                 /* note: nothing that throws an exception (e.g. funcRWRateLimiter for
                     "--rwmixthrpct") must be between emplace_back and UploadPartAsync()
@@ -5230,7 +5304,7 @@ void LocalWorker::s3ModeUploadObjectMultiPartAsync(std::string bucketName, std::
                 /* note: streamBuf (member of S3MemoryStream) needs to be initialized in loop to
                     have the exact remaining blockSize as len. otherwise the AWS SDK will send full
                     streamBuf len despite smaller contentLength in UploadPartRequest. */
-                std::shared_ptr<Aws::IOStream> s3MemStream = std::make_shared<S3MemoryStream>(
+                std::shared_ptr<Aws::IOStream> s3MemStream = makeS3UploadBodyStream(
                     (unsigned char*) ioBufVec[currentIODepth], blockSize);
 
                 asyncPartContext.ioStartT = std::chrono::steady_clock::now();
@@ -5488,10 +5562,11 @@ void LocalWorker::s3ModeUploadObjectMultiPartShared(std::string bucketName, std:
         /* note: streamBuf (member of S3MemoryStream) needs to be initialized in loop to
             have the exact remaining blockSize as len. otherwise the AWS SDK will send full
             streamBuf len despite smaller contentLength in UploadPartRequest. */
-        std::shared_ptr<Aws::IOStream> s3MemStream = std::make_shared<S3MemoryStream>(
+        std::shared_ptr<Aws::IOStream> s3MemStream = makeS3UploadBodyStream(
             (unsigned char*) ioBufVec[0], blockSize);
 
-		((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
+		if(!useS3UploadStreamRateLimit)
+			((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
 
 		std::chrono::steady_clock::time_point ioStartT = std::chrono::steady_clock::now();
 
@@ -5697,7 +5772,8 @@ void LocalWorker::s3ModeUploadObjectMultiPartSharedAsync(std::string bucketName,
                 const uint64_t currentPartNum =
                     1 + (currentOffset / rwOffsetGen->getBlockSize() ); // +1 for 1-based part range
 
-                ((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
+                if(!useS3UploadStreamRateLimit)
+                    ((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
 
                 /* note: nothing that throws an exception (e.g. funcRWRateLimiter for
                     "--rwmixthrpct") must be between emplace_back and UploadPartAsync()
@@ -5708,7 +5784,7 @@ void LocalWorker::s3ModeUploadObjectMultiPartSharedAsync(std::string bucketName,
                 /* note: streamBuf (member of S3MemoryStream) needs to be initialized in loop to
                     have the exact remaining blockSize as len. otherwise the AWS SDK will send full
                     streamBuf len despite smaller contentLength in UploadPartRequest. */
-                std::shared_ptr<Aws::IOStream> s3MemStream = std::make_shared<S3MemoryStream>(
+                std::shared_ptr<Aws::IOStream> s3MemStream = makeS3UploadBodyStream(
                     (unsigned char*) ioBufVec[currentIODepth], blockSize);
 
                 asyncPartContext.ioStartT = std::chrono::steady_clock::now();
