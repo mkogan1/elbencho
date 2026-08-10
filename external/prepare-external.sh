@@ -217,6 +217,42 @@ prepare_awssdk_prebuilt_libs()
 
 # If user did not provide pre-built AWS SDK libs, then prepare git clone and required tag. If clone
 # didn't exist yet or if tag changed then configure build, install libs and build a single static
+# Apply elbencho patches under external/patches/aws-sdk-cpp-*.patch to the AWS SDK
+# working tree. Newly applied patches invalidate the combined static lib so it rebuilds.
+apply_awssdk_patches()
+{
+	local CLONE_DIR="$1"
+	local INSTALL_DIR="$2"
+	local LIB_FILE_NAME="$3"
+	local PATCH_DIR="${EXTERNAL_BASE_DIR}/patches"
+	local patch_applied_new=0
+	local p
+
+	[ -d "$CLONE_DIR" ] || return 0
+	[ -d "$PATCH_DIR" ] || return 0
+
+	shopt -s nullglob
+	for p in "$PATCH_DIR"/aws-sdk-cpp-*.patch; do
+		cd "$CLONE_DIR" || exit 1
+		if git apply --reverse --check "$p" >/dev/null 2>&1; then
+			echo "AWS SDK patch already applied: $(basename "$p")"
+		else
+			echo "Applying AWS SDK patch: $(basename "$p")..."
+			if ! git apply "$p"; then
+				echo "ERROR: Failed to apply AWS SDK patch: $p"
+				exit 1
+			fi
+			patch_applied_new=1
+		fi
+	done
+	shopt -u nullglob
+
+	if [ "$patch_applied_new" -eq 1 ]; then
+		echo "AWS SDK sources patched; invalidating previously built static lib for rebuild."
+		rm -f "$INSTALL_DIR"/lib*/"$LIB_FILE_NAME"
+	fi
+}
+
 # lib containing all static AWS SDK libs. If clone exitsted and tag changed, then clean/uninstall
 # previous build before switching tag.
 prepare_awssdk()
@@ -234,11 +270,6 @@ prepare_awssdk()
 	local CLONE_DIR="${EXTERNAL_BASE_DIR}/aws-sdk-cpp"
 	local INSTALL_DIR="${EXTERNAL_BASE_DIR}/aws-sdk-cpp_install"
 	local LIB_FILE_NAME="libaws-sdk-all.a"
-
-	# fast path: check if lib file exists, in which case previous build completed
-	if [ -e "$INSTALL_DIR"/lib*/"$LIB_FILE_NAME" ]; then
-	  return 0
-	fi
 
 	# change to external subdir if we were called from somewhere else
 	cd "$EXTERNAL_BASE_DIR" || exit 1
@@ -267,6 +298,14 @@ prepare_awssdk()
 				"Consider \"make clean-all\" before retrying a partially completed clone."
 			exit 1
 		fi
+	fi
+
+	# Apply fork patches (e.g. UNSIGNED-PAYLOAD Never) before the fast-path return.
+	apply_awssdk_patches "$CLONE_DIR" "$INSTALL_DIR" "$LIB_FILE_NAME"
+
+	# fast path: check if lib file exists, in which case previous build completed
+	if [ -e "$INSTALL_DIR"/lib*/"$LIB_FILE_NAME" ]; then
+	  return 0
 	fi
 
 	# configure, build and install

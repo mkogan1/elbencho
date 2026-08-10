@@ -632,10 +632,18 @@ void ProgArgs::defineAllowedArgs()
 /*s3f*/	(ARG_S3FASTGET_LONG, bpo::bool_switch(&this->useS3FastRead),
 			"Send downloaded objects directly to /dev/null instead of a memory buffer. This option "
 			"is incompatible with any buffer post-processing options like data verification or "
-			"GPU data transfer.")
+			"GPU data transfer. Also sets AWS_RESPONSE_CHECKSUM_VALIDATION=when_required to skip "
+			"response body checksum hashing; without this option, response checksum validation "
+			"uses the SDK default (when_supported).")
 /*s3f*/ (ARG_S3FASTPUT_LONG,
-            "Reduce CPU overhead for uploads. Enables \"--" ARG_S3SIGNPAYLOAD_LONG "=2 (never)\", "
+            "Reduce CPU overhead for uploads. Enables \"--" ARG_S3UNSIGNED_LONG "\" "
+            "(x-amz-content-sha256=UNSIGNED-PAYLOAD, including over HTTP) and "
             "\"--" ARG_S3NOCOMPRESS_LONG "\".")
+/*s3u*/ (ARG_S3UNSIGNED_LONG,
+            "Force SigV4 unsigned payload: set x-amz-content-sha256=UNSIGNED-PAYLOAD and skip "
+            "client-side payload SHA-256. Also effective over HTTP (useful for local S3-compatible "
+            "benchmarks; weaker than signed payload). Equivalent to \"--" ARG_S3SIGNPAYLOAD_LONG
+            "=2\".")
 /*s3i*/	(ARG_S3IGNOREERRORS_LONG, bpo::bool_switch(&this->ignoreS3Errors),
 			"Ignore any S3 upload/download errors. Useful for stress-testing.")
 /*s3k*/	(ARG_S3ACCESSKEY_LONG, bpo::value(&this->s3AccessKey),
@@ -739,9 +747,9 @@ void ProgArgs::defineAllowedArgs()
             "(Hint: See \"--" ARG_VERSION_LONG "\" output to check if this build is using the AWS "
             "S3 CRT libraries.)")
 /*s3s*/	(ARG_S3SIGNPAYLOAD_LONG, bpo::value(&this->s3SignPolicy),
-			"S3 payload signing policy. 0=RequestDependent, 1=Always, 2=Never. Changing this to "
-			"'Never' has no effect with current S3 SDK as described in Github issue 3297. "
-			"(Default: 0)")
+			"S3 payload signing policy. 0=RequestDependent, 1=Always, 2=Never "
+			"(x-amz-content-sha256=UNSIGNED-PAYLOAD; also effective over HTTP in this build). "
+			"See also \"--" ARG_S3UNSIGNED_LONG "\". (Default: 0)")
 /*s3s*/	(ARG_S3STATDIRS_LONG, bpo::bool_switch(&this->runS3StatDirs),
             "Run bucket attributes query phase.")
 /*s3m*/	(ARG_S3TROUGHPUTTARGET_LONG, bpo::value(&this->s3ThroughputTargetGbps),
@@ -1303,6 +1311,9 @@ void ProgArgs::initImplicitValues()
         s3SignPolicy = 2; /* Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never */
         s3NoCompression = true;
     }
+
+    if(argsVariablesMap.count(ARG_S3UNSIGNED_LONG) )
+        s3SignPolicy = 2; /* Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never */
 
     if(argsVariablesMap.count(ARG_S3CHECKSUM_ALGO_2_LONG) )
     { // this is just an old compat alias
@@ -3485,7 +3496,9 @@ void ProgArgs::printHelpS3()
 		(ARG_S3FASTGET_LONG, bpo::bool_switch(&this->useS3FastRead),
 			"Send downloaded objects directly to /dev/null instead of a memory buffer. This option "
 			"is incompatible with any buffer post-processing options like data verification or "
-			"GPU data transfer.")
+			"GPU data transfer. Also sets AWS_RESPONSE_CHECKSUM_VALIDATION=when_required to skip "
+			"response body checksum hashing; without this option, response checksum validation "
+			"uses the SDK default (when_supported).")
 		(ARG_TREEFILE_LONG, bpo::value(&this->treeFilePath),
 			"The path to a treefile containing a list of object names to use for shared upload or "
 			"download if the object size exceeds \"--" ARG_FILESHARESIZE_LONG "\".")

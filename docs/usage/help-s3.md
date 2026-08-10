@@ -52,7 +52,11 @@ Frequently Used Options:
   --s3fastget           Send downloaded objects directly to /dev/null instead 
                         of a memory buffer. This option is incompatible with 
                         any buffer post-processing options like data 
-                        verification or GPU data transfer.
+                        verification or GPU data transfer. Also sets 
+                        AWS_RESPONSE_CHECKSUM_VALIDATION=when_required to skip 
+                        response body checksum hashing; without this option, 
+                        response checksum validation uses the SDK default 
+                        (when_supported).
   --treefile arg        The path to a treefile containing a list of object 
                         names to use for shared upload or download if the 
                         object size exceeds "--sharesize".
@@ -89,6 +93,3 @@ Examples:
     $ elbencho --s3endpoints http://S3SERVER --s3key S3KEY --s3secret S3SECRET \
         -w -t 8 -s 1g -b 16m "s3://mybucket/myobject[1-4]"
 </code></pre>
-
-See also: [`s3-bandwidth-shaping.md`](s3-bandwidth-shaping.md) for throughput smoothing and
-bandwidth-cap tuning guidance with examples.

@@ -1,0 +1,74 @@
+diff --git a/src/aws-cpp-sdk-core/include/aws/core/auth/signer/AWSAuthV4Signer.h b/src/aws-cpp-sdk-core/include/aws/core/auth/signer/AWSAuthV4Signer.h
+index e10b660e4..06115f40f 100644
+--- a/src/aws-cpp-sdk-core/include/aws/core/auth/signer/AWSAuthV4Signer.h
++++ b/src/aws-cpp-sdk-core/include/aws/core/auth/signer/AWSAuthV4Signer.h
+@@ -59,7 +59,8 @@ namespace Aws
+ 
+         public:
+             /**
+-             * Even though different payload signing polices, HTTP will force payload signing to be on.
++             * Payload signing policy for SigV4. elbencho honors Never over HTTP as well
++             * (upstream AWS SDK historically forced signing for non-HTTPS).
+              */
+             enum class PayloadSigningPolicy
+             {
+@@ -72,7 +73,8 @@ namespace Aws
+                  */
+                 Always,
+                 /**
+-                 * Never sign the body of the request
++                 * Never sign the body of the request (x-amz-content-sha256=UNSIGNED-PAYLOAD).
++                 * elbencho: also effective over HTTP for S3-compatible local benchmarks.
+                  */
+                 Never
+             };
+@@ -81,8 +83,8 @@ namespace Aws
+              * serviceName,  canonical service name to sign with
+              * region, region string to use in signature
+              * signPayloads, if Always, the payload will have a sha256 computed on the body of the request. If this is set
+-             *    to Never, the sha256 will not be computed on the body. This is only useful for Amazon S3 over Https. If
+-             *    Https is not used then this flag will be ignored. If set to RequestDependent, compute or not is based on
++             *    to Never, the sha256 will not be computed on the body and UNSIGNED-PAYLOAD is used
++             *    (elbencho: also over HTTP). If set to RequestDependent, compute or not is based on
+              *    the value from AmazonWebServiceRequest::SignBody()
+              */
+             AWSAuthV4Signer(const std::shared_ptr<Auth::AWSCredentialsProvider>& credentialsProvider,
+diff --git a/src/aws-cpp-sdk-core/source/auth/signer/AWSAuthV4Signer.cpp b/src/aws-cpp-sdk-core/source/auth/signer/AWSAuthV4Signer.cpp
+index bcca2d2e6..c7df948c9 100644
+--- a/src/aws-cpp-sdk-core/source/auth/signer/AWSAuthV4Signer.cpp
++++ b/src/aws-cpp-sdk-core/source/auth/signer/AWSAuthV4Signer.cpp
+@@ -109,7 +109,10 @@ bool AWSAuthV4Signer::SignRequestWithSigV4a(Aws::Http::HttpRequest& request, con
+     if (signatureType == Aws::Crt::Auth::SignatureType::HttpRequestViaHeaders)
+     {
+         Aws::String payloadHash(UNSIGNED_PAYLOAD);
+-        if(signBody || request.GetUri().GetScheme() != Http::Scheme::HTTPS)
++        /* elbencho: honor PayloadSigningPolicy::Never even over HTTP so S3-compatible
++         * local benchmarks can skip body SHA-256 (x-amz-content-sha256=UNSIGNED-PAYLOAD). */
++        const bool forceUnsignedPayload = (m_payloadSigningPolicy == PayloadSigningPolicy::Never);
++        if(!forceUnsignedPayload && (signBody || request.GetUri().GetScheme() != Http::Scheme::HTTPS))
+         {
+             if (!request.GetContentBody())
+             {
+@@ -125,6 +128,7 @@ bool AWSAuthV4Signer::SignRequestWithSigV4a(Aws::Http::HttpRequest& request, con
+         else
+         {
+             AWS_LOGSTREAM_DEBUG(v4AsymmetricLogTag, "Note: Http payloads are not being signed. signPayloads=" << signBody
++                    << " payloadSigningPolicy=" << static_cast<int>(m_payloadSigningPolicy)
+                     << " http scheme=" << Http::SchemeMapper::ToString(request.GetUri().GetScheme()));
+         }
+         awsSigningConfig.SetSignedBodyValue(payloadHash.c_str());
+@@ -222,6 +226,14 @@ bool AWSAuthV4Signer::SignRequestWithCreds(Aws::Http::HttpRequest& request, cons
+     if (request.GetRequestHash().second != nullptr && !request.GetRequestHash().first.empty() && 
+         request.GetContentBody() != nullptr && request.HasHeader(Http::AWS_TRAILER_HEADER)) {
+         payloadHash = STREAMING_UNSIGNED_PAYLOAD_TRAILER;
++    } else if (m_payloadSigningPolicy == PayloadSigningPolicy::Never) {
++        /* elbencho: restore Never semantics (ignored by upstream AWS SDK after default
++         * checksum changes; see aws-sdk-cpp#3297). Also apply over HTTP so local
++         * S3-compatible benchmarks can use x-amz-content-sha256=UNSIGNED-PAYLOAD. */
++        payloadHash = UNSIGNED_PAYLOAD;
++        AWS_LOGSTREAM_DEBUG(v4LogTag, "PayloadSigningPolicy::Never: using " << UNSIGNED_PAYLOAD
++                << " without hashing request body. http scheme="
++                << Http::SchemeMapper::ToString(request.GetUri().GetScheme()));
+     } else {
+       payloadHash = ComputePayloadHash(request);
+       if (payloadHash.empty()) {

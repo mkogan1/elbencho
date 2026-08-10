@@ -101,6 +101,13 @@ void S3Tk::initS3Global(const ProgArgs* progArgs)
        (note: this also disables chunked multi-part uploads) */
 	setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required", 0);
 
+	/* With "--s3fastget", skip response checksum validation for lower CPU (body goes to
+	   /dev/null anyway). Without it, leave the SDK default (when_supported) so GetObject
+	   validates x-amz-checksum-* when the server returns them. Can still be overridden via
+	   AWS_RESPONSE_CHECKSUM_VALIDATION in the environment. */
+	if(progArgs->getUseS3FastRead() )
+		setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required", 0);
+
 	Aws::InitAPI(*s3SDKOptions);
 
 

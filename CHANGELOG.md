@@ -2,6 +2,10 @@
 
 ## v3.1.12 (work in progress)
 
+### New Features & Enhancements
+* New option "--s3unsigned" to force SigV4 `x-amz-content-sha256=UNSIGNED-PAYLOAD` (also over HTTP). "--s3fastput" / "--s3sign=2" now honor Never after an AWS SDK patch (upstream ignored it; see aws-sdk-cpp#3297).
+* `--s3fastget` sets `AWS_RESPONSE_CHECKSUM_VALIDATION=when_required` to skip GetObject response-body hashing (body goes to `/dev/null`). Without `--s3fastget`, response checksum validation keeps the SDK default (`when_supported`). Override via the `AWS_RESPONSE_CHECKSUM_VALIDATION` environment variable.
+
 ## v3.1.11 (July 24, 2026)
 
 ### General Changes

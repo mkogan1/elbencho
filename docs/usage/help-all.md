@@ -339,9 +339,19 @@ All options in alphabetical order:
   --s3fastget             Send downloaded objects directly to /dev/null instead
                           of a memory buffer. This option is incompatible with 
                           any buffer post-processing options like data 
-                          verification or GPU data transfer.
-  --s3fastput             Reduce CPU overhead for uploads. Enables "--s3sign=2 
-                          (never)", "--s3nocompress".
+                          verification or GPU data transfer. Also sets 
+                          AWS_RESPONSE_CHECKSUM_VALIDATION=when_required to 
+                          skip response body checksum hashing; without this 
+                          option, response checksum validation uses the SDK 
+                          default (when_supported).
+  --s3fastput             Reduce CPU overhead for uploads. Enables 
+                          "--s3unsigned" (x-amz-content-sha256=UNSIGNED-PAYLOAD
+                          , including over HTTP) and "--s3nocompress".
+  --s3unsigned            Force SigV4 unsigned payload: set 
+                          x-amz-content-sha256=UNSIGNED-PAYLOAD and skip 
+                          client-side payload SHA-256. Also effective over HTTP
+                          (useful for local S3-compatible benchmarks; weaker 
+                          than signed payload). Equivalent to "--s3sign=2".
   --s3ignoreerrors        Ignore any S3 upload/download errors. Useful for 
                           stress-testing.
   --s3key arg             S3 access key. (This can also be set via the 
@@ -440,9 +450,9 @@ All options in alphabetical order:
                           "--version" output to check if this build is using 
                           the AWS S3 CRT libraries.)
   --s3sign arg            S3 payload signing policy. 0=RequestDependent, 
-                          1=Always, 2=Never. Changing this to 'Never' has no 
-                          effect with current S3 SDK as described in Github 
-                          issue 3297. (Default: 0)
+                          1=Always, 2=Never (x-amz-content-sha256=UNSIGNED-PAYL
+                          OAD; also effective over HTTP in this build). See 
+                          also "--s3unsigned". (Default: 0)
   --s3statdirs            Run bucket attributes query phase.
   --s3targetgbps arg      The throughput target for each S3 client instance in 
                           Gbps (gigabits per second) based on which the client 
