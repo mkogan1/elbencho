@@ -16,6 +16,7 @@
 #include "toolkits/FileTk.h"
 #include "toolkits/spdk/SpdkNvmeClient.h"
 #include "toolkits/random/RandAlgoSelectorTk.h"
+#include "toolkits/Crc64Nvme.h"
 #include "toolkits/S3RdmaTk.h"
 #include "toolkits/S3Tk.h"
 #include "toolkits/StringTk.h"
@@ -473,6 +474,13 @@ void LocalWorker::finishPhase()
 		elapsedUSecVec[0] = finishElapsedUSec;
 	}
 
+	if(numS3RdmaChecksumsVerified)
+	{
+		LOGGER(Log_VERBOSE, "Worker " << workerRank << ": S3 RDMA whole-object reads verified "
+			"against x-amz-checksum-crc64nvme: " << numS3RdmaChecksumsVerified << std::endl);
+		numS3RdmaChecksumsVerified = 0;
+	}
+
 	phaseFinished = true; // before incNumWorkersDone() because Coordinator can reset after inc
 
 	incNumWorkersDone();
@@ -565,9 +573,11 @@ void LocalWorker::initS3Client()
             case S3ChecksumAlgorithm::CRC32C:
             case S3ChecksumAlgorithm::SHA1:
             case S3ChecksumAlgorithm::SHA256:
-            //case S3ChecksumAlgorithm::CRC64NVME: // crc64nvme not supported by aws sdk currently
-                // because of missing uploadPartRequest.SetChecksumCRC64NVME for
-                // S3Tk::addUploadPartRequestChecksum()
+                break;
+            case S3ChecksumAlgorithm::CRC64NVME:
+                /* on the HTTP path the aws sdk lacks uploadPartRequest.SetChecksumCRC64NVME for
+                    S3Tk::addUploadPartRequestChecksum(), so this is a no-op there; the RDMA
+                    path (--cuobj) computes and sends it itself and verifies it on reads. */
                 break;
             default:
                 throw WorkerException(std::string("Invalid S3 checksum algorithm: ") +
@@ -5499,6 +5509,15 @@ void LocalWorker::s3ModeUploadObjectSinglePartRdma(std::string bucketName, std::
 	ctx.bucket = bucketName;
 	ctx.object = objectName;
 
+	// checksum the payload the server will read (the host copy; the GPU copy is identical)
+	if(s3ChecksumAlgorithm == S3ChecksumAlgorithm::CRC64NVME)
+	{
+		uint64_t crc = Crc64Nvme::calc(0, ioBufVec[0], blockSize);
+		if(getenv("ELBENCHO_S3RDMA_CORRUPT_CHECKSUM") ) // test hook: server must reject
+			crc ^= 1;
+		ctx.checksumCrc64nvme = Crc64Nvme::toBase64(crc);
+	}
+
 	OPLOG_PRE_OP("S3PutObjectRDMA", bucketName + "/" + objectName, currentOffset, blockSize);
 
 	ssize_t rdmaRes = rdmaPutWithRetry(*s3RdmaClient, *s3RdmaControlPlane, ctx, rdmaBuf, blockSize);
@@ -6983,6 +7002,8 @@ void LocalWorker::s3ModeDownloadObjectRdma(std::string bucketName, std::string o
 		S3RdmaClientCtx ctx;
 		ctx.bucket = bucketName;
 		ctx.object = objectName;
+		ctx.checksumMode = (s3ChecksumAlgorithm == S3ChecksumAlgorithm::CRC64NVME);
+		ctx.wholeObject = (currentOffset == 0) && (blockSize == progArgs->getFileSize() );
 
 		OPLOG_PRE_OP("S3GetObjectRDMA", bucketName + "/" + objectName, currentOffset, blockSize);
 
@@ -7017,6 +7038,27 @@ void LocalWorker::s3ModeDownloadObjectRdma(std::string bucketName, std::string o
 			cudaMemcpyGPUToHost(ioBufVec[0], gpuIOBufVec[0], blockSize);
 
 		((*this).*funcPostReadBlockChecker)(ioBufVec[0], gpuIOBufVec[0], blockSize, currentOffset);
+
+		/* end-to-end integrity: the stored checksum is full-object, so it can only be checked
+			when this read covered the whole object */
+		if(ctx.checksumMode && !ctx.checksumCrc64nvme.empty() && (currentOffset == 0) &&
+			( (uint64_t)rdmaRes == progArgs->getFileSize() ) )
+		{
+			uint64_t crc = Crc64Nvme::calc(0, ioBufVec[0], rdmaRes);
+			if(getenv("ELBENCHO_S3RDMA_CORRUPT_CHECKSUM") ) // test hook: must be reported
+				crc ^= 1;
+			const std::string computed = Crc64Nvme::toBase64(crc);
+
+			IF_UNLIKELY(computed != ctx.checksumCrc64nvme)
+				throw WorkerException(std::string("S3 RDMA checksum mismatch. ") +
+					"Endpoint: " + s3EndpointStr + "; "
+					"Bucket: " + bucketName + "; "
+					"Object: " + objectName + "; "
+					"x-amz-checksum-crc64nvme: " + ctx.checksumCrc64nvme + "; "
+					"computed: " + computed);
+
+			numS3RdmaChecksumsVerified++;
+		}
 
 		if(rdmaRes > 0)
 		{

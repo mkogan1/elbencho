@@ -125,6 +125,7 @@ class LocalWorker : public Worker
 		RateLimiterRWMixThreads rateLimiterRWMixThreads; // for r/w threads rate balance if set
 
 		uint64_t numIOPSSubmitted{0}; // internal sequential counter, not reset between phases
+		uint64_t numS3RdmaChecksumsVerified{0}; // whole-object RDMA GETs checked against x-amz-checksum-crc64nvme
 
 		// phase-dependent variables
 		BenchPhase benchPhase{BenchPhase_IDLE};

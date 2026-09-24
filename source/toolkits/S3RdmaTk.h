@@ -26,6 +26,15 @@ struct S3RdmaClientCtx
 	std::string uploadID; // empty for single-shot (non-multipart)
 	uint32_t partNumber = 0; // 1..10000 when uploadID is set
 	std::string etag; // populated on success
+	/* CRC-64/NVME as S3 encodes it (base64 of 8 big-endian bytes). rdmaPut sends it as
+		x-amz-checksum-crc64nvme when set, so the server verifies the RDMA-read payload and stores
+		it; rdmaGet asks for the stored value (x-amz-checksum-mode: ENABLED) when checksumMode is
+		set and returns it here (empty if the object has none). */
+	std::string checksumCrc64nvme;
+	bool checksumMode = false;
+	/* set by the caller when the GET covers the whole object: rdmaGet then sends no Range header,
+		which is what lets the server return the stored full-object checksum */
+	bool wholeObject = false;
 };
 
 /**

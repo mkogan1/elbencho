@@ -644,8 +644,11 @@ void ProgArgs::defineAllowedArgs()
             "Verify the correctness of S3 bucket versioning settings. (Requires "
             "\"--" ARG_S3BUCKETVER_LONG "\")")
 /*s3c*/	(ARG_S3CHECKSUM_ALGO_LONG, bpo::value(&this->s3ChecksumAlgoStr),
-            "S3 checksum algorithm to use (CRC32, CRC32C, SHA1, SHA256). This sets the "
-            "x-amz-sdk-checksum-algorithm header for S3 operations. (EXPERIMENTAL)")
+            "S3 checksum algorithm to use (CRC32, CRC32C, SHA1, SHA256, CRC64NVME). This sets "
+            "the x-amz-sdk-checksum-algorithm header for S3 operations. CRC64NVME applies to "
+            "S3-over-RDMA (\"--" ARG_CUOBJ_LONG "\"): the checksum is sent with each RDMA PUT "
+            "and whole-object RDMA GETs are verified against the returned "
+            "x-amz-checksum-crc64nvme. (EXPERIMENTAL)")
 /*s3c*/	(ARG_S3CREDFILE_LONG, bpo::value(&this->s3CredentialsFile),
 			"Path to file containing multiple S3 credentials. Each line in format: "
 			"access_key:secret_key. Lines starting with # are treated as comments.")

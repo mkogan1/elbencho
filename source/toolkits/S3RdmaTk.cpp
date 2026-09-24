@@ -283,6 +283,13 @@ ssize_t S3RdmaControlPlane::rdmaPut(S3RdmaClientCtx& ctx, const char* token, uin
 		req->SetHeaderValue("content-type", "application/octet-stream");
 		req->SetContentLength("0");
 
+		// integrity: the server checksums the payload it RDMA-reads and verifies it against this
+		if(!ctx.checksumCrc64nvme.empty() )
+		{
+			req->SetHeaderValue("x-amz-sdk-checksum-algorithm", "CRC64NVME");
+			req->SetHeaderValue("x-amz-checksum-crc64nvme", ctx.checksumCrc64nvme.c_str() );
+		}
+
 		impl->signV4(*req); // manual SigV4 with UNSIGNED-PAYLOAD
 
 		auto resp = impl->http->MakeRequest(req);
@@ -345,8 +352,13 @@ ssize_t S3RdmaControlPlane::rdmaGet(S3RdmaClientCtx& ctx, const char* token, uin
 		req->SetHeaderValue("x-amz-content-sha256", UNSIGNED_PAYLOAD);
 		req->SetHeaderValue(AMZ_RDMA_TOKEN, token);
 
-		// Byte-range fetch when reading a slice of the object (server replies 206).
-		if(size != 0)
+		ctx.checksumCrc64nvme.clear();
+		if(ctx.checksumMode)
+			req->SetHeaderValue("x-amz-checksum-mode", "ENABLED");
+
+		// Byte-range fetch when reading a slice of the object (server replies 206). A whole-object
+		// read goes without Range: S3 only returns x-amz-checksum-* on un-ranged GETs.
+		if(size != 0 && !ctx.wholeObject)
 			req->SetHeaderValue("range",
 				("bytes=" + std::to_string(offset) + "-" +
 					std::to_string(offset + size - 1) ).c_str() );
@@ -381,6 +393,12 @@ ssize_t S3RdmaControlPlane::rdmaGet(S3RdmaClientCtx& ctx, const char* token, uin
 
 		if(resp->HasHeader("etag") )
 			ctx.etag = stripQuotes(resp->GetHeader("etag").c_str() );
+
+		if(resp->HasHeader("x-amz-checksum-crc64nvme") )
+			ctx.checksumCrc64nvme = resp->GetHeader("x-amz-checksum-crc64nvme").c_str();
+		else if(ctx.checksumMode)
+			LOGGER(Log_DEBUG, "rdmaGet: no x-amz-checksum-crc64nvme in response for key=" <<
+				ctx.object << " (object has no stored checksum or server omits it)" << std::endl);
 
 		// Trust the server's reported transferred byte count (can be < requested
 		// for ranged/partial GETs).
