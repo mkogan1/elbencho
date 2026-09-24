@@ -648,7 +648,7 @@ void ProgArgs::defineAllowedArgs()
             "the x-amz-sdk-checksum-algorithm header for S3 operations. CRC64NVME applies to "
             "S3-over-RDMA (\"--" ARG_CUOBJ_LONG "\"): the checksum is sent with each RDMA PUT "
             "and whole-object RDMA GETs are verified against the returned "
-            "x-amz-checksum-crc64nvme. (EXPERIMENTAL)")
+            "x-amz-checksum-crc64nvme, on the GPU for GPU-direct reads. (EXPERIMENTAL)")
 /*s3c*/	(ARG_S3CREDFILE_LONG, bpo::value(&this->s3CredentialsFile),
 			"Path to file containing multiple S3 credentials. Each line in format: "
 			"access_key:secret_key. Lines starting with # are treated as comments.")

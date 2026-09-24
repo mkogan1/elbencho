@@ -233,6 +233,16 @@ endif
 # Include build helpers for auto detection
 include build_helpers/AutoDetection.mk
 
+# CUDA kernels (GPU-side checksums). CUDA_ARCH selects the SASS target; PTX for the same
+# virtual arch is embedded too, so newer GPUs JIT it.
+ifeq ($(CUDA_SUPPORT),1)
+CU_SOURCES := $(shell find $(SOURCE_PATH) -name '*.cu')
+CU_OBJECTS := $(CU_SOURCES:.cu=.cu.o)
+NVCC       ?= $(shell ls /usr/local/cuda/bin/nvcc /usr/local/cuda*/bin/nvcc 2>/dev/null | head -n1)
+CUDA_ARCH  ?= sm_86
+NVCCFLAGS  ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -I $(SOURCE_PATH) -DCUDA_SUPPORT
+endif
+
 # Backtrace support
 # Note: Gets auto-detected and gets set by CYGWIN_SUPPORT=1, so needs to come after those
 ifeq ($(BACKTRACE_SUPPORT), 1)
@@ -252,12 +262,12 @@ endif
 all: $(SOURCES) $(EXE)
 
 
-$(EXE): $(OBJECTS)
+$(EXE): $(OBJECTS) $(CU_OBJECTS)
 ifdef BUILD_VERBOSE
-	$(CXX) -o $(EXE) $(OBJECTS) $(LDFLAGS) $(LDFLAGS_MIMALLOC_TAIL)
+	$(CXX) -o $(EXE) $(OBJECTS) $(CU_OBJECTS) $(LDFLAGS) $(LDFLAGS_MIMALLOC_TAIL)
 else
 	@echo [LINK] $@
-	@$(CXX) -o $(EXE) $(OBJECTS) $(LDFLAGS) $(LDFLAGS_MIMALLOC_TAIL)
+	@$(CXX) -o $(EXE) $(OBJECTS) $(CU_OBJECTS) $(LDFLAGS) $(LDFLAGS_MIMALLOC_TAIL)
 endif
 
 
@@ -301,6 +311,18 @@ endif
 # "Makefile" as dependency to rebuild all on Makefile change.
 # Dependency chain is: Makefile -> features-info -> features-detect -> externals
 $(OBJECTS): Makefile | features-info
+
+ifneq ($(CU_OBJECTS),)
+$(CU_OBJECTS): Makefile | features-info
+
+%.cu.o: %.cu
+ifdef BUILD_VERBOSE
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+else
+	@echo [NVCC] $@
+	@$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+endif
+endif
 
 
 externals:
@@ -656,6 +678,8 @@ help:
 	@echo '   CUDA_INCLUDE_PATH=<path>   - Path to directory containing cuda_runtime.h.'
 	@echo '                                (Default: search under /usr/local/cuda*")'
 	@echo '   CUDA_LIB_PATH=<path>       - Path to directory containing libcudart.so.'
+	@echo '   CUDA_ARCH=<sm_XX>          - GPU architecture for CUDA kernels (GPU-side'
+	@echo '                                checksums). Default: sm_86.'
 	@echo '                                (Default: search under /usr/local/cuda*")'
 	@echo '   CUFILE_INCLUDE_PATH=<path> - Path to directory containing cufile.h.'
 	@echo '                                (Default: search under /usr/local/cuda*")'

@@ -27,6 +27,7 @@
 
 #ifdef CUDA_SUPPORT
     #include <cuda_runtime.h>
+    #include "toolkits/Crc64NvmeCuda.h"
 #endif
 
 #ifdef S3_SUPPORT
@@ -1694,6 +1695,16 @@ void LocalWorker::allocGPUIOBuffer()
 		throw WorkerException("Seeding GPU/CUDA random number generator failed. "
 			"curand error code: " + std::to_string(seedRes) );
 
+	try
+	{
+		crc64Cuda = new Crc64NvmeCuda(progArgs->getBlockSize() );
+	}
+	catch(std::exception& e)
+	{
+		throw WorkerException("Initialization of GPU checksum context failed. "
+			"GPU ID: " + std::to_string(gpuID) + "; " + e.what() );
+	}
+
 	// alloc number of GPU IO buffers matching iodepth
 	for(size_t i=0; i < progArgs->getIODepth(); i++)
 	{
@@ -1884,6 +1895,9 @@ void LocalWorker::cleanup()
 
 	if(gpuRandGen)
 	{
+		delete crc64Cuda;
+		crc64Cuda = NULL;
+
 		curandDestroyGenerator(gpuRandGen);
 		gpuRandGen = NULL;
 	}
@@ -2881,6 +2895,34 @@ bool LocalWorker::preRWRateBalanceLimiterForWriters(size_t rwSize,
 void LocalWorker::noOpCudaMemcpy(void* hostIOBuf, void* gpuIOBuf, size_t count)
 {
 	return; // noop
+}
+
+/**
+ * CRC-64/NVME of an RDMA buffer, computed where the data is: on the GPU for a VRAM buffer
+ * (GPU-direct), on the host otherwise.
+ *
+ * @isGPUBuf true if buf is a device pointer.
+ * @throw WorkerException if the GPU checksum fails.
+ */
+uint64_t LocalWorker::rdmaBufCrc64Nvme(const void* buf, size_t len, bool isGPUBuf)
+{
+#ifdef CUDA_SUPPORT
+	if(isGPUBuf)
+	{
+		try
+		{
+			return crc64Cuda->calc(buf, len);
+		}
+		catch(std::exception& e)
+		{
+			throw WorkerException("GPU checksum failed. "
+				"GPU ID: " + std::to_string(gpuID) + "; "
+				"Byte count: " + std::to_string(len) + "; " + e.what() );
+		}
+	}
+#endif // CUDA_SUPPORT
+
+	return Crc64Nvme::calc(0, buf, len);
 }
 
 /**
@@ -5509,10 +5551,10 @@ void LocalWorker::s3ModeUploadObjectSinglePartRdma(std::string bucketName, std::
 	ctx.bucket = bucketName;
 	ctx.object = objectName;
 
-	// checksum the payload the server will read (the host copy; the GPU copy is identical)
+	// checksum the buffer the server will read: in VRAM via the GPU kernel, else host memory
 	if(s3ChecksumAlgorithm == S3ChecksumAlgorithm::CRC64NVME)
 	{
-		uint64_t crc = Crc64Nvme::calc(0, ioBufVec[0], blockSize);
+		uint64_t crc = rdmaBufCrc64Nvme(rdmaBuf, blockSize, areGPUsGiven);
 		if(getenv("ELBENCHO_S3RDMA_CORRUPT_CHECKSUM") ) // test hook: server must reject
 			crc ^= 1;
 		ctx.checksumCrc64nvme = Crc64Nvme::toBase64(crc);
@@ -7033,8 +7075,9 @@ void LocalWorker::s3ModeDownloadObjectRdma(std::string bucketName, std::string o
 				"Requested blocksize: " + std::to_string(blockSize) + "; "
 				"Bytes transferred: " + std::to_string(rdmaRes) );
 
-		// bring the received data to the host buffer for verification (GPU-direct landed it in VRAM)
-		if(areGPUsGiven)
+		/* the --verify block check needs the received data in host memory; the checksum
+			verification below does not (GPU-direct data is checksummed in VRAM) */
+		if(areGPUsGiven && progArgs->getIntegrityCheckSalt() )
 			cudaMemcpyGPUToHost(ioBufVec[0], gpuIOBufVec[0], blockSize);
 
 		((*this).*funcPostReadBlockChecker)(ioBufVec[0], gpuIOBufVec[0], blockSize, currentOffset);
@@ -7044,7 +7087,7 @@ void LocalWorker::s3ModeDownloadObjectRdma(std::string bucketName, std::string o
 		if(ctx.checksumMode && !ctx.checksumCrc64nvme.empty() && (currentOffset == 0) &&
 			( (uint64_t)rdmaRes == progArgs->getFileSize() ) )
 		{
-			uint64_t crc = Crc64Nvme::calc(0, ioBufVec[0], rdmaRes);
+			uint64_t crc = rdmaBufCrc64Nvme(rdmaBuf, rdmaRes, areGPUsGiven);
 			if(getenv("ELBENCHO_S3RDMA_CORRUPT_CHECKSUM") ) // test hook: must be reported
 				crc ^= 1;
 			const std::string computed = Crc64Nvme::toBase64(crc);

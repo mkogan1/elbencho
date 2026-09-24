@@ -45,6 +45,8 @@
 typedef std::vector<BasicSocket*> SocketVec;
 
 // delaration for function typedefs below
+class Crc64NvmeCuda; // toolkits/Crc64NvmeCuda.h (CUDA_SUPPORT only)
+
 class LocalWorker;
 
 // io_prep_pwrite or io_prep_read from libaio
@@ -153,6 +155,7 @@ class LocalWorker : public Worker
 #ifdef CUDA_SUPPORT
 		int gpuID{-1}; // GPU ID for this worker, initialized in allocGPUIOBuffer
 		curandGenerator_t gpuRandGen{NULL};
+		Crc64NvmeCuda* crc64Cuda{NULL}; // checksums RDMA buffers in VRAM; set in allocGPUIOBuffer
 #endif
 
 #ifdef S3_SUPPORT
@@ -244,6 +247,7 @@ class LocalWorker : public Worker
 
 		void allocIOBuffer();
 		void allocGPUIOBuffer();
+		uint64_t rdmaBufCrc64Nvme(const void* buf, size_t len, bool isGPUBuf);
 		void prepareCustomTreePathStores();
 
 		int64_t rwBlockSized();
