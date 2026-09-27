@@ -425,6 +425,140 @@ Details and porting checklist for **client** CPU cuts: `HANDOVER.md`.
 
 ---
 
+## `--s3rdma` — out-of-band RDMA data path (NVIDIA cuObject)
+
+`--s3fastput` / `--s3fastget` cut *hashing* CPU but the payload still travels the
+TCP body. `--s3rdma` removes the body entirely: the S3 request stays plain HTTP
+(SigV4 auth, headers, metadata), while object bytes move by RDMA between our
+registered I/O buffer and the RGW buffer pool.
+
+### Build
+
+```bash
+make clean-all   # required when toggling features
+nice make S3_SUPPORT=1 S3_AWSCRT=0 S3RDMA_SUPPORT=1 -j $(nproc)
+```
+
+`S3RDMA_SUPPORT=1` implies `S3_SUPPORT=1`. It is **not** auto-detected (unlike
+`CUFILE_SUPPORT`) precisely because it would force the expensive AWS SDK clone
+and build on anyone who merely has CUDA installed. Needs `libcuobjclient` +
+`libcufile`; override paths with `CUOBJ_INCLUDE_PATH` / `CUOBJ_LIB_PATH`.
+
+### Client options
+
+| Option | Meaning |
+|---|---|
+| `--s3rdma` | Enable the RDMA data path for PUT / GET (incl. MPU parts) |
+| `--rdma` | Short alias for `--s3rdma` (same flag name as NooBaa `s3perf`) |
+| `--cuda` | Shorthand for `--gpuids 0` (same flag name as NooBaa `s3perf`) |
+| `--s3rdmabufsize` | Client-side assertion that block size fits the server buffer (default `8M`) |
+
+`--s3rdma` implies `--s3unsigned` (`s3SignPolicy = Never`): the protocol
+*requires* `x-amz-content-sha256: UNSIGNED-PAYLOAD`, since the body is empty and
+the payload never passes the signer. It also disables `--s3fastget`.
+
+Buffers: host `ioBufVec` is always registered; with `--gpuids` / `--cuda` the CUDA
+device buffers are registered too and used as the RDMA target, i.e. the true
+GPUDirect path (`cuObjClient::getMemoryType()` reports `CUOBJ_MEMORY_CUDA_DEVICE`).
+
+There is deliberately **no** `--local_ip` equivalent to `s3perf`'s: the client's
+RDMA interface is selected by the cuObject config file, not by a CLI flag.
+`s3perf --local_ip` only binds the HTTP socket.
+
+### Client-side cuObject config
+
+Select it with `CUFILE_ENV_PATH_JSON=/etc/cuobj.json`; the RDMA NIC IP goes into
+`properties.rdma_dev_addr_list`:
+
+```json
+{ "logging": { "level": "ERROR" },
+  "execution": { "parallel_io": false },
+  "properties": { "allow_compat_mode": true, "use_pci_p2pdma": true,
+                  "rdma_peer_type": "dmabuf",
+                  "rdma_dev_addr_list": [ "10.64.66.207" ] } }
+```
+
+```bash
+CUFILE_ENV_PATH_JSON=/etc/cuobj.json ./bin/elbencho --rdma \
+  --s3endpoints http://10.64.66.207:6001 --s3key ... --s3secret ... \
+  -b 4k -s 4k -t 1 -n 0 -N 1 -w bkt
+```
+
+### Wire contract
+
+Spec: NVIDIA aws-c-s3 `nvidia_rdma` fork `RDMA_PROTOCOL_SPEC.md`, and
+`noobaa-core/docs/design/S3-over-RDMA.md`. Implemented by both NooBaa and RGW.
+
+* Request: `x-amz-rdma-agent: cuobj`, `x-amz-rdma-token: <descriptor>`,
+  `Content-Length: 0`, empty body, `x-amz-content-sha256: UNSIGNED-PAYLOAD`, and
+  the token listed among the signed headers. No chunked encoding.
+* cuObj token format `raddr:rsize:rkey:lid:qp:has_gid:gid`, printed as
+  `"%016lx:%08x:%08x:%04x:%06x:%01x:%016lx%016lx"` — 7 fixed-length hex fields.
+* Removed vs a standard PUT: `Content-MD5`, `Transfer-Encoding`,
+  `Content-Encoding: aws-chunked`, `x-amz-decoded-content-length`. Preserved:
+  `Content-Type` and `x-amz-checksum-*` (computed over the raw buffer).
+* Response: `x-amz-rdma-reply` = 200/204/206 → the server moved the data by RDMA
+  (206 for a ranged GET); 501 → the server understood but declined; header
+  absent → the server does not implement the protocol at all.
+  `x-amz-rdma-bytes-transferred` (decimal) accompanies a GET.
+* Each MPU part negotiates RDMA independently; `CompleteMultipartUpload` is
+  unchanged.
+
+Detection is therefore authoritative, not heuristic. Because no AWS SDK result
+class exposes unmodeled response headers, `source/toolkits/S3RdmaMonitor.{h,cpp}`
+registers an `Aws::Monitoring::MonitoringInterface` listener (via
+`SDKOptions::monitoringOptions`) which stashes the parsed reply in a
+`thread_local` — valid because the sync client runs the hooks inline on the
+submitting thread. `SetHeadersReceivedEventHandler` is *not* usable: the curl
+backend fires it from inside the body-write callback, so with `Content-Length: 0`
+it never fires.
+
+Byte accounting also comes from the RDMA callback (`atomicLiveOps.numBytesDone`),
+since the data-sent/received handlers never fire for an empty body.
+
+### NooBaa reference implementation
+
+`/mnt/nvme0n1p1/src-git/noobaa-core` — `src/util/rdma_utils.js` (token parsing,
+header set/parse, the client middleware) and `src/tools/s3perf.js --rdma --cuda`.
+Server side is gated by `CONFIG_JS_S3_RDMA_ENABLED=true`.
+
+### RGW side (Ceph tree, commit `079d19f4198`)
+
+```bash
+ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_RADOSGW_CUOBJ=ON" ./do_cmake.sh
+RGW=1 ../src/vstart.sh -d -n -x --localhost --bluestore \
+  -o "rgw_cuobj_enabled=true" -o "rgw_cuobj_rdma_ip=<RDMA NIC IP>"
+```
+
+| Option | Default | Note |
+|---|---|---|
+| `rgw_cuobj_enabled` | `false` | |
+| `rgw_cuobj_rdma_ip` | *(empty)* | must be set, otherwise init fails |
+| `rgw_cuobj_rdma_port` | `20886` | |
+| `rgw_cuobj_buffer_size` | `8M` | elbencho block size must stay ≤ this |
+| `rgw_cuobj_buffer_count` | `128` | |
+| `rgw_cuobj_num_dcis` | `128` | |
+
+Check `build/out/radosgw.*.log` for `WARNING: cuObj RDMA server init failed`.
+
+### Known limitations
+
+* `--iodepth > 1` is rejected: `cuObjPut`/`cuObjGet` are synchronous, so the
+  async MPU / download variants cannot be driven from the callback.
+* `--limitread` / `--limitwrite` fall back to the coarse pre-op wait: the
+  mid-transfer pacing hook is the upload body stream, which no longer exists.
+  A NOTE is logged at startup.
+* `--s3fastget` is silently disabled by `--s3rdma` (both bypass the body).
+* A `501` decline is treated as an error. The spec says the client should retry
+  over the HTTP body instead (PUT stores nothing, GET already sent the data in
+  the body) — for a benchmark, failing loudly is more useful than silently
+  measuring TCP, but it does deviate from the spec.
+* `copy_source` is not supported by the server on the RDMA path.
+* MPU part upload is inferred from `RGWPutObj::execute()` being shared with
+  single-part PUT; verify against a live server.
+
+---
+
 ## Typical lab workload
 
 Backend: local RGW, NVMe ~**1000 MiB/s**. Leave headroom under that or you get

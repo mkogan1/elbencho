@@ -20,6 +20,10 @@ CUFILE_INCLUDE_PATH      ?= $(shell find /usr/local/cuda/ /usr/local/cuda* -name
                             -printf '%h\n' 2>/dev/null | head -n1)
 CUFILE_LIB_PATH          ?= $(shell find /usr/local/cuda/ /usr/local/cuda* -name libcufile.so \
                             -printf '%h\n' 2>/dev/null | head -n1)
+CUOBJ_INCLUDE_PATH       ?= $(shell find /usr/local/cuda/ /usr/local/cuda* /usr/include \
+                            -name cuobjclient.h -printf '%h\n' 2>/dev/null | head -n1)
+CUOBJ_LIB_PATH           ?= $(shell find /usr/local/cuda/ /usr/local/cuda* /usr/lib64 /usr/lib \
+                            -name libcuobjclient.so -printf '%h\n' 2>/dev/null | head -n1)
 
 # Prepare CUDA compile/link flags...
 ifneq ($(CUDA_INCLUDE_PATH),)
@@ -43,6 +47,16 @@ CXXFLAGS_CUFILE_SUPPORT    += -DCUFILE_SUPPORT
 LDFLAGS_CUFILE_SUPPORT     += -lcufile
 CUFILE_SUPPORT_DETECT_ARGS  = $(CXXFLAGS_CUFILE_SUPPORT) $(LDFLAGS_CUFILE_SUPPORT) \
                               $(CUDA_SUPPORT_DETECT_ARGS)
+
+# Prepare S3 RDMA (NVIDIA cuObject client) compile/link flags...
+ifneq ($(CUOBJ_INCLUDE_PATH),)
+ CXXFLAGS_S3RDMA_SUPPORT   += -I $(CUOBJ_INCLUDE_PATH)
+endif
+ifneq ($(CUOBJ_LIB_PATH),)
+ LDFLAGS_S3RDMA_SUPPORT    += -L $(CUOBJ_LIB_PATH)
+endif
+CXXFLAGS_S3RDMA_SUPPORT    += -DS3RDMA_SUPPORT
+LDFLAGS_S3RDMA_SUPPORT     += -lcuobjclient -lcufile
 
 ####### LIB "backtrace" ########
 
@@ -138,6 +152,32 @@ ifeq ($(CUFILE_SUPPORT),1)
 endif
 
 ###### End CUFILE (GDS) Support #####
+
+######## S3 RDMA (cuObject) Support ########
+#### (Opt-in only, never auto-detected, ####
+####  because it implies S3_SUPPORT.)   ####
+
+ifeq ($(S3RDMA_SUPPORT),1)
+ ifdef BUILD_VERBOSE
+  $(info [S3RDMA] $(CXXFLAGS_S3RDMA_SUPPORT) $(LDFLAGS_S3RDMA_SUPPORT) )
+ endif
+
+ CXXFLAGS     += $(CXXFLAGS_S3RDMA_SUPPORT)
+ LDFLAGS      += $(LDFLAGS_S3RDMA_SUPPORT)
+
+ # cuobjclient.h includes cufile.h, so make sure its include path is available even when the
+ # cuFile (GDS) feature itself is disabled.
+ ifneq ($(CUFILE_SUPPORT),1)
+  ifneq ($(CUFILE_INCLUDE_PATH),)
+   CXXFLAGS   += -I $(CUFILE_INCLUDE_PATH)
+  endif
+  ifneq ($(CUFILE_LIB_PATH),)
+   LDFLAGS    += -L $(CUFILE_LIB_PATH)
+  endif
+ endif
+endif
+
+###### End S3 RDMA (cuObject) Support ######
 
 ########## CUDA Support #############
 

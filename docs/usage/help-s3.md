@@ -71,6 +71,13 @@ Miscellaneous Options:
                         an object. (Default: 0, which means 32 x blocksize)
   --s3region arg        S3 region. (This can also be set via the AWS_REGION or 
                         AWS_DEFAULT_REGION env variable.)
+  --s3rdma              Transfer S3 object data out-of-band via RDMA instead of
+                        through the HTTP body, using the NVIDIA cuObject client
+                        lib. Requires a cuObject-enabled S3 server and a build 
+                        with S3RDMA_SUPPORT=1.
+  --s3rdmabufsize arg   RDMA buffer size of the S3 server, used for a 
+                        client-side check that the block size fits into a 
+                        single server buffer. (Default: 8M)
   --zones arg           Comma-separated list of NUMA zones to bind this process
                         to. If multiple zones are given, then worker threads 
                         are bound round-robin to the zones. (Hint: See 'lscpu' 

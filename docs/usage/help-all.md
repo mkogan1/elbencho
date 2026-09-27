@@ -56,6 +56,12 @@ All options in alphabetical order:
                           "--livecsv" for progress results in csv format.) 
                           (Default: Store in "/var/tmp" under a subdir that 
                           contains the username.)
+  --cufile                Use cuFile API for reads/writes to/from GPU memory, 
+                          also known as GPUDirect Storage (GDS).
+  --cufiledriveropen      Explicitly initialize cuFile lib and open the 
+                          nvida-fs driver.
+  --cuhostbufreg          Pin host memory buffers and register with CUDA for 
+                          faster transfer to/from GPU.
   -D [ --deldirs ]        Delete directories.
   -d [ --mkdirs ]         Create directories. (Already existing dirs are not 
                           treated as error.)
@@ -98,6 +104,25 @@ All options in alphabetical order:
   --foreground            When running as service, stay in foreground and 
                           connected to console instead of detaching from 
                           console and daemonizing into background.
+  --gds                   Use Nvidia GPUDirect Storage API. Enables "--direct",
+                          "--cufile", "--gdsbufreg".
+  --gdsbufreg             Register GPU buffers for GPUDirect Storage (GDS) when
+                          using cuFile API.
+  --gpuids arg            Comma-separated list of CUDA GPU IDs to use for 
+                          buffer allocation. If no other option for GPU buffers
+                          is given then read/write timings will include copy 
+                          to/from GPU buffers. GPU IDs will be assigned round 
+                          robin to different threads. When this is given in 
+                          service mode then the given list will override any 
+                          list given by the master, which can be used to bind 
+                          specific service instances to specific GPUs. The 
+                          special value "all" is short for the list of all 
+                          available GPUs. (Hint: CUDA GPU IDs are 0-based; see 
+                          'nvidia-smi' for available GPU IDs.)
+  --gpuperservice         Assign GPUs round robin to service instances (i.e. 
+                          one GPU per service) instead of default round robin 
+                          to threads (i.e. multiple GPUs per service, if 
+                          multiple given).
   --hosts arg             List of hosts in service mode (separated by comma, 
                           space, or newline) for coordinated benchmark. When 
                           this argument is used, this program instance runs in 
@@ -432,6 +457,27 @@ All options in alphabetical order:
                           object for each S3 block read. Only effective in read
                           phase and in combination with "-n" & "-N". Read limit
                           for all threads is defined by "--randamount".
+  --s3rdma                Transfer S3 object data out-of-band via RDMA instead 
+                          of through the HTTP body, using the NVIDIA cuObject 
+                          client lib. The S3 control path (auth, headers, 
+                          metadata) still goes through HTTP. Requires a 
+                          cuObject-enabled S3 server and a build with 
+                          S3RDMA_SUPPORT=1. Block size must not exceed the 
+                          server's RDMA buffer size, see "--s3rdmabufsize". 
+                          Implies "--s3unsigned", because the protocol requires
+                          x-amz-content-sha256=UNSIGNED-PAYLOAD. Takes 
+                          precedence over "--s3fastget". Not compatible with 
+                          upload rate limiting.
+  --rdma                  Short alias for "--s3rdma", matching the flag name of
+                          the NooBaa "s3perf" benchmark tool.
+  --cuda                  Use GPU memory as the RDMA buffer, i.e. GPUDirect. 
+                          Shorthand for "--gpuids 0", matching the flag name of
+                          the NooBaa "s3perf" benchmark tool. Use "--gpuids" 
+                          directly to select a different or multiple GPUs.
+  --s3rdmabufsize arg     RDMA buffer size of the S3 server, used for a 
+                          client-side check that the block size fits into a 
+                          single server buffer. (Ceph RGW: 
+                          "rgw_cuobj_buffer_size".) (Default: 8M)
   --s3sse                 Server-side encryption of S3 objects using SSE-S3. 
                           (EXPERIMENTAL)
   --s3sseckey arg         Base64-encoded AES-256 encryption key for S3 SSE-C.
