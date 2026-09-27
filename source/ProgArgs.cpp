@@ -88,6 +88,7 @@
 // Names of features for printVersionAndBuildInfo()
 #define FEATURE_NAME_S3_SUPPORT     "s3"
 #define FEATURE_NAME_S3_AWSCRT      "s3crt"
+#define FEATURE_NAME_S3RDMA_SUPPORT "s3rdma"
 
 
 /**
@@ -726,6 +727,25 @@ void ProgArgs::defineAllowedArgs()
 			"effective in read phase and in combination with \"-" ARG_NUMDIRS_SHORT "\" & \"-"
 			ARG_NUMFILES_SHORT "\". Read limit for all threads is defined by \"--"
 			ARG_RANDOMAMOUNT_LONG "\".")
+/*s3r*/	(ARG_S3RDMA_LONG, bpo::bool_switch(&this->useS3Rdma),
+			"Transfer S3 object data out-of-band via RDMA instead of through the HTTP body, using "
+			"the NVIDIA cuObject client lib. The S3 control path (auth, headers, metadata) still "
+			"goes through HTTP. Requires a cuObject-enabled S3 server and a build with "
+			"S3RDMA_SUPPORT=1. Block size must not exceed the server's RDMA buffer size, see "
+			"\"--" ARG_S3RDMABUFSIZE_LONG "\". Implies \"--" ARG_S3UNSIGNED_LONG "\", because the "
+			"protocol requires x-amz-content-sha256=UNSIGNED-PAYLOAD. Takes precedence over \"--"
+			ARG_S3FASTGET_LONG "\". Not compatible with upload rate limiting.")
+/*r*/	(ARG_RDMA_LONG, bpo::bool_switch(&this->useRdmaAlias),
+			"Short alias for \"--" ARG_S3RDMA_LONG "\", matching the flag name of the NooBaa "
+			"\"s3perf\" benchmark tool.")
+/*c*/	(ARG_CUDA_LONG, bpo::bool_switch(&this->useCudaAlias),
+			"Use GPU memory as the RDMA buffer, i.e. GPUDirect. Shorthand for \"--"
+			ARG_GPUIDS_LONG " 0\", matching the flag name of the NooBaa \"s3perf\" benchmark tool. "
+			"Use \"--" ARG_GPUIDS_LONG "\" directly to select a different or multiple GPUs.")
+/*s3r*/	(ARG_S3RDMABUFSIZE_LONG, bpo::value(&this->s3RdmaBufSizeOrigStr),
+			"RDMA buffer size of the S3 server, used for a client-side check that the block size "
+			"fits into a single server buffer. (Ceph RGW: \"rgw_cuobj_buffer_size\".) "
+			"(Default: 8M)")
 /*s3o*/	(ARG_S3SSE_LONG, bpo::bool_switch(&this->useS3SSE),
             "Server-side encryption of S3 objects using SSE-S3. (EXPERIMENTAL)")
 /*s3s*/	(ARG_S3SSECKEY_LONG, bpo::value(&this->s3SSECKey),
@@ -983,6 +1003,8 @@ void ProgArgs::defineDefaults()
     this->s3MpuSizeVarianceOrigStr = "0";
     this->s3MpuSplitSize = 0;
     this->s3MpuSplitSizeOrigStr = "0";
+    this->s3RdmaBufSize = 8*1024*1024;
+    this->s3RdmaBufSizeOrigStr = "8M";
     this->s3NoCompression = false;
     this->s3NoMpuCompletion = false;
     this->s3IgnoreMultipartUpload404 = false;
@@ -1035,6 +1057,9 @@ void ProgArgs::defineDefaults()
     this->useS3MPUSharing = false;
     this->useS3ObjectPrefixRand = false;
     this->useS3RandObjSelect = false;
+    this->useS3Rdma = false;
+    this->useRdmaAlias = false;
+    this->useCudaAlias = false;
     this->useS3SSE = false;
     this->useS3VirtualAddressing = false;
     this->useStridedAccess = false;
@@ -1315,6 +1340,20 @@ void ProgArgs::initImplicitValues()
     if(argsVariablesMap.count(ARG_S3UNSIGNED_LONG) )
         s3SignPolicy = 2; /* Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never */
 
+    if(useRdmaAlias)
+        useS3Rdma = true; // "--rdma" is just a short alias for "--s3rdma"
+
+    if(useCudaAlias && gpuIDsStr.empty() )
+        gpuIDsStr = "0"; // "--cuda" is shorthand for using the first GPU as RDMA buffer
+
+    if(useS3Rdma)
+    {
+        /* The RDMA protocol requires x-amz-content-sha256=UNSIGNED-PAYLOAD: the body is empty and
+            the payload never passes through the signer, so a signed payload hash would not match
+            what the server received out-of-band. */
+        s3SignPolicy = 2; /* Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never */
+    }
+
     if(argsVariablesMap.count(ARG_S3CHECKSUM_ALGO_2_LONG) )
     { // this is just an old compat alias
         s3ChecksumAlgoStr = argsVariablesMap[ARG_S3CHECKSUM_ALGO_2_LONG].as<std::string>();
@@ -1352,6 +1391,7 @@ void ProgArgs::convertUnitStrings()
 	netBenchRespSize = UnitTk::numHumanToBytesBinary(netBenchRespSizeOrigStr, false);
     s3MpuSizeVariance = UnitTk::numHumanToBytesBinary(s3MpuSizeVarianceOrigStr, false);
     s3MpuSplitSize = UnitTk::numHumanToBytesBinary(s3MpuSplitSizeOrigStr, false);
+    s3RdmaBufSize = UnitTk::numHumanToBytesBinary(s3RdmaBufSizeOrigStr, false);
 	sockRecvBufSize = UnitTk::numHumanToBytesBinary(sockRecvBufSizeOrigStr, false);
 	sockSendBufSize = UnitTk::numHumanToBytesBinary(sockSendBufSizeOrigStr, false);
 
@@ -1649,6 +1689,42 @@ void ProgArgs::checkPathDependentArgs()
 	if(!s3EndpointsVec.empty() && s3MpuSizeVariance && (doReverseSeqOffsets || useRandomOffsets) &&
 		runCreateFilesPhase)
 		throw ProgException("S3 MPU size variance can only be used with sequential upload.");
+
+	if(useS3Rdma)
+	{
+		#ifndef S3RDMA_SUPPORT
+			throw ProgException("Option \"--" ARG_S3RDMA_LONG "\" requires an executable built "
+				"with S3RDMA_SUPPORT=1.");
+		#endif
+
+		if(s3EndpointsVec.empty() )
+			throw ProgException("Option \"--" ARG_S3RDMA_LONG "\" requires S3 endpoints "
+				"definition.");
+
+		if(ioDepth > 1)
+			throw ProgException("Option \"--" ARG_S3RDMA_LONG "\" is not supported in combination "
+				"with \"--" ARG_IODEPTH_LONG "\", because the RDMA transfer of a block is "
+				"synchronous.");
+
+		if(blockSize > s3RdmaBufSize)
+			throw ProgException("Block size exceeds the RDMA buffer size of the S3 server, so the "
+				"server would reject the transfer. "
+				"Block size: " + blockSizeOrigStr + "; "
+				"Server RDMA buffer size: " + s3RdmaBufSizeOrigStr + " "
+				"(see \"--" ARG_S3RDMABUFSIZE_LONG "\")");
+
+		if(limitReadBps || limitWriteBps)
+			LOGGER(Log_NORMAL, "NOTE: Rate limits do not apply to the RDMA data path, because the "
+				"payload does not go through the HTTP body." << std::endl);
+
+		if(useS3FastRead)
+		{ // both bypass the HTTP body, so there is nothing left for fastget to save
+			LOGGER(Log_NORMAL, "NOTE: Ignoring \"--" ARG_S3FASTGET_LONG "\" because \"--"
+				ARG_S3RDMA_LONG "\" already bypasses the HTTP response body." << std::endl);
+
+			useS3FastRead = false;
+		}
+	}
 
 	if( (hasUserSetRWMixPercent() || hasUserSetRWMixReadThreads() ) &&
         (benchMode == BenchMode_S3) &&
@@ -3520,6 +3596,13 @@ void ProgArgs::printHelpS3()
 		(ARG_S3REGION_LONG, bpo::value(&this->s3Region),
 			"S3 region. (This can also be set via the " S3_ENV_REGION " or "
 			S3_ENV_REGION_DEFAULT " env variable.)")
+		(ARG_S3RDMA_LONG, bpo::bool_switch(&this->useS3Rdma),
+			"Transfer S3 object data out-of-band via RDMA instead of through the HTTP body, using "
+			"the NVIDIA cuObject client lib. Requires a cuObject-enabled S3 server and a build "
+			"with S3RDMA_SUPPORT=1.")
+		(ARG_S3RDMABUFSIZE_LONG, bpo::value(&this->s3RdmaBufSizeOrigStr),
+			"RDMA buffer size of the S3 server, used for a client-side check that the block size "
+			"fits into a single server buffer. (Default: 8M)")
 		(ARG_NUMAZONES_LONG, bpo::value(&this->numaZonesStr),
 			"Comma-separated list of NUMA zones to bind this process to. If multiple zones are "
 			"given, then worker threads are bound round-robin to the zones. "
@@ -3739,6 +3822,12 @@ void ProgArgs::printVersionAndBuildInfo()
     notIncludedStream << FEATURE_NAME_S3_AWSCRT << " ";
 #endif
 
+#ifdef S3RDMA_SUPPORT
+    includedStream << FEATURE_NAME_S3RDMA_SUPPORT << " ";
+#else
+    notIncludedStream << FEATURE_NAME_S3RDMA_SUPPORT << " ";
+#endif
+
 #ifdef SYNCFS_SUPPORT
 	includedStream << "syncfs ";
 #else
@@ -3889,6 +3978,8 @@ void ProgArgs::setFromPropertyTreeForService(bpt::ptree& tree)
 	useS3FastRead = tree.get<bool>(ARG_S3FASTGET_LONG);
     useS3MPUSharing = tree.get<bool>(ARG_S3MPUSHARING_LONG);
 	useS3RandObjSelect = tree.get<bool>(ARG_S3RANDOBJ_LONG);
+	useS3Rdma = tree.get<bool>(ARG_S3RDMA_LONG);
+	s3RdmaBufSize = tree.get<size_t>(ARG_S3RDMABUFSIZE_LONG);
     useS3SSE = tree.get<bool>(ARG_S3SSE_LONG);
     useS3VirtualAddressing = tree.get<bool>(ARG_S3VIRTADDRESSING_LONG);
 	useStridedAccess = tree.get<bool>(ARG_STRIDEDACCESS_LONG);
@@ -4039,6 +4130,8 @@ void ProgArgs::getAsPropertyTreeForService(bpt::ptree& outTree, size_t serviceRa
     outTree.put(ARG_S3OBJTAG_LONG, doS3ObjectTag);
     outTree.put(ARG_S3OBJTAGVERIFY_LONG, doS3ObjectTagVerify);
 	outTree.put(ARG_S3RANDOBJ_LONG, useS3RandObjSelect);
+	outTree.put(ARG_S3RDMA_LONG, useS3Rdma);
+	outTree.put(ARG_S3RDMABUFSIZE_LONG, s3RdmaBufSize);
 	outTree.put(ARG_S3REGION_LONG, s3Region);
     outTree.put(ARG_S3SESSION_TOKEN_LONG, s3SessionToken);
 	outTree.put(ARG_S3SIGNPAYLOAD_LONG, s3SignPolicy);

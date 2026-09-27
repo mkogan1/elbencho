@@ -63,6 +63,34 @@ tools/test-examples.sh [-b] [-d] [-m] <BASEDIR>
 - `-b` skips block-device tests (no root); `-d` / `-m` skip distributed / multi-file cases.
 - After code changes, rebuild then run relevant smoke tests before claiming success.
 
+## S3 RDMA (`--s3rdma`, branch `wip-s3rdma`)
+
+Build the lab binary with the classic S3 client. `S3_AWSCRT=1` does not apply this path.
+
+```bash
+nice make -j $(nproc) S3_SUPPORT=1 S3_AWSCRT=0 S3RDMA_SUPPORT=1
+```
+
+`make clean-all` first when toggling `S3_SUPPORT` / `S3RDMA_SUPPORT`. Client env: `CUFILE_ENV_PATH_JSON=/etc/cuobj.json`. Startup line: `S3 RDMA fabric connected (cuObject).`
+
+| Path | Role |
+|------|------|
+| `source/toolkits/S3RdmaTk.cpp` | Shared process-wide `cuObjClient`; each worker has its own registered buffer. `cuObjGet` / `cuObjPut` invoke the SDK HTTP request through a callback. |
+| `source/toolkits/S3RdmaTk.h` | `x-amz-rdma-*` header names and callback interface |
+| `source/toolkits/S3RdmaMonitor.cpp` | Captures RDMA reply headers from SDK responses for transfer validation |
+| `source/toolkits/S3Tk.cpp` | Forces HTTP response checksum validation to `WHEN_REQUIRED` for RDMA |
+| `source/workers/LocalWorker.cpp` | GET always sends a bounded `Range`. Multipart RDMA failures and interruption attempt to abort the upload before propagating the original exception. |
+
+The normal S3 SDK handles authentication, headers, retries, and HTTP requests. The object payload moves outside the HTTP body, so `--s3rdma` forces unsigned payload signing and skips SDK response-body checksum validation. Missing RDMA confirmation is an error unless `--s3ignoreerrors` is selected. Concurrent calls on different registered buffers are supported; cuObject does not use the `execution.parallel_io` setting.
+
+GET data direction is server RDMA write (`handleGetObject`, NIC TX on the RGW). PUT uses server RDMA read (`handlePutObject`, NIC RX on the RGW). NIC counters cover all traffic on the interface and cannot alone attribute reverse traffic to cuObject.
+
+Lab finding (RGW `10.40.68.55`, 4 MiB objects): `-N` is per worker, so increasing `-t` also increases the dataset. At `-t 40 -n 1`, reducing `-N 250` (~39.1 GiB) to `-N 8` (1.25 GiB) restored ~20,025 MiB/s with the same thread count. This supports a cache/backing-I/O explanation; the exact cache layer was not established. Server-side `mmfsd` RDMA activity was observed, while the client's RDMA read-request counter stayed at zero. Do not treat the earlier apparent 32-thread cliff as a cuObject concurrency limit. The original client implementation performed equally well after removing the four experimental follow-up commits.
+
+RGW must finish its RDMA write before returning HTTP GET success; that server fix is independent of the dataset finding. The DCI pool is created at server initialization, so changing `rgw_cuobj_num_dcis` requires an radosgw restart.
+
+RGW tree: `/mnt/nvme0n1p1/src-git/ceph--mk--wip_cuobj`, branch `wip-rgw-s3rdma01`; GET completion fix: `13b7870d3b1`. `HANDOVER.md` and `CLAUDE.md` contain earlier diagnostic notes, including hypotheses superseded by these findings.
+
 ## Agent guidance
 
 - Prefer small, focused diffs that match surrounding style.

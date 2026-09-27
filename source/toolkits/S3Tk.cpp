@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2020-2025 Sven Breuner and elbencho contributors
+// SPDX-FileCopyrightText: 2020-2026 Sven Breuner and elbencho contributors
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "Common.h"
@@ -7,6 +7,7 @@
 #include "ProgArgs.h"
 #include "toolkits/Base64Encoder.h"
 #include "toolkits/S3CredentialStore.h"
+#include "toolkits/S3RdmaMonitor.h"
 #include "toolkits/S3Tk.h"
 #include "toolkits/StringTk.h"
 #include "toolkits/TerminalTk.h"
@@ -108,6 +109,14 @@ void S3Tk::initS3Global(const ProgArgs* progArgs)
 	if(progArgs->getUseS3FastRead() )
 		setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required", 0);
 
+	/* The RDMA reply headers are not part of any modeled S3 result, so we need a monitoring
+		listener to get hold of them. (Only registered when actually needed, because it sees
+		every request of every worker.) */
+	#ifdef S3RDMA_SUPPORT
+		if(progArgs->getUseS3Rdma() )
+			S3RdmaMonitor::registerFactory(*s3SDKOptions);
+	#endif // S3RDMA_SUPPORT
+
 	Aws::InitAPI(*s3SDKOptions);
 
 
@@ -208,6 +217,14 @@ std::shared_ptr<S3Client> S3Tk::initS3Client(const ProgArgs* progArgs,
     config.requestCompressionConfig.requestMinCompressionSizeBytes = 1;
     config.requestCompressionConfig.useRequestCompression = (progArgs->getS3NoCompression() ?
         Aws::Client::UseRequestCompression::DISABLE : Aws::Client::UseRequestCompression::ENABLE);
+
+	/* RDMA carries the object outside the HTTP body, so the SDK cannot validate its checksum.
+		Force this even if the environment requests validation with "when_supported". */
+	#ifndef S3_AWSCRT
+		if(progArgs->getUseS3Rdma() )
+			config.checksumConfig.responseChecksumValidation =
+				Aws::Client::ResponseChecksumValidation::WHEN_REQUIRED;
+	#endif
 
 
 #ifdef S3_AWSCRT

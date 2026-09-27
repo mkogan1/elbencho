@@ -39,8 +39,15 @@ LIBNUMA_SUPPORT    ?= 1
 SYNCFS_SUPPORT     ?= 1
 S3_AWSCRT          ?= 0
 S3_SUPPORT         ?= 0
+S3RDMA_SUPPORT     ?= 0
 SYSCALLH_SUPPORT   ?= 1
 THREADNAME_SUPPORT ?= 1
+
+# S3 RDMA (NVIDIA cuObject) needs the S3 client, so it implies S3_SUPPORT.
+# (Compile/link flags are prepared in build_helpers/AutoDetection.mk.)
+ifeq ($(S3RDMA_SUPPORT), 1)
+  override S3_SUPPORT = 1
+endif
 
 CXXFLAGS_COMMON   = -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 $(CXXFLAGS_BOOST) \
 	-DEXE_NAME=\"$(EXE_NAME)\" -DEXE_VERSION=\"$(EXE_VERSION)\" \
@@ -351,6 +358,16 @@ else
 	$(info [OPT] S3 support disabled. (Enable via S3_SUPPORT=1))
 endif
 
+ifeq ($(S3RDMA_SUPPORT),1)
+ ifdef BUILD_VERBOSE
+	$(info [OPT] S3 RDMA (cuObject) support enabled (CUOBJ_INCLUDE_PATH: $(CUOBJ_INCLUDE_PATH)))
+ else
+	$(info [OPT] S3 RDMA (cuObject) support enabled)
+ endif
+else
+	$(info [OPT] S3 RDMA (cuObject) support disabled. (Enable via S3RDMA_SUPPORT=1))
+endif
+
 ifeq ($(USE_MIMALLOC),1)
 	$(info [OPT] mimalloc enabled)
 else
@@ -554,6 +571,10 @@ help:
 	@echo '                             compatible with BUILD_STATIC=1. (Default: 0)'
 	@echo '   S3_SUPPORT=0|1          - Build with S3 support. This will fetch a AWS SDK'
 	@echo '                             git repo of over 1GB size. (Default: 0)'
+	@echo '   S3RDMA_SUPPORT=0|1      - Build with S3 RDMA support based on the NVIDIA'
+	@echo '                             cuObject client lib, for out-of-band RDMA data'
+	@echo '                             transfer with a cuObject-enabled S3 server.'
+	@echo '                             Implies S3_SUPPORT=1. (Default: 0)'
 	@echo '   USE_MIMALLOC=0|1        - Use Microsoft mimalloc library for memory'
 	@echo '                             allocation management. Recommended when using'
 	@echo '                             musl-libc. (Default: 0)'
@@ -581,6 +602,10 @@ help:
 	@echo '   CUFILE_INCLUDE_PATH=<path> - Path to directory containing cufile.h.'
 	@echo '                                (Default: search under /usr/local/cuda*")'
 	@echo '   CUFILE_LIB_PATH=<path>     - Path to directory containing libcufile.so.'
+	@echo '                                (Default: search under /usr/local/cuda*")'
+	@echo '   CUOBJ_INCLUDE_PATH=<path>  - Path to directory containing cuobjclient.h.'
+	@echo '                                (Default: search under /usr/local/cuda*")'
+	@echo '   CUOBJ_LIB_PATH=<path>      - Path to directory containing libcuobjclient.so.'
 	@echo '                                (Default: search under /usr/local/cuda*")'
 	@echo
 	@echo 'Targets:'

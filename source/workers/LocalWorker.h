@@ -19,6 +19,8 @@
 #include "toolkits/random/RandAlgoInterface.h"
 #include "toolkits/RateLimiter.h"
 #include "toolkits/RateLimiterRWMixThreads.h"
+#include "toolkits/S3RdmaMonitor.h"
+#include "toolkits/S3RdmaTk.h"
 #include "toolkits/S3Tk.h"
 #include "S3UploadStore.h"
 #include "Worker.h"
@@ -160,6 +162,10 @@ class LocalWorker : public Worker
 		S3ChecksumAlgorithm s3ChecksumAlgorithm; // for x-amz-sdk-checksum-algorithm header
 		bool useS3UploadStreamRateLimit{false}; /* mid-transfer --limitwrite via paced upload
 			body stream; skips pre-part rate wait for S3 uploads */
+
+		bool useS3Rdma{false}; // out-of-band RDMA data transfer via cuObject
+		S3RdmaClient* s3RdmaClient{NULL}; // process-wide singleton, not owned; only set if useS3Rdma
+		BufferVec s3RdmaRegisteredBufVec; // buffers this worker registered on s3RdmaClient
 #endif
 
 #ifdef HDFS_SUPPORT
@@ -193,6 +199,8 @@ class LocalWorker : public Worker
         void uninitLibAio();
 		void initS3Client();
 		void uninitS3Client();
+		void initS3RdmaClient();
+		void uninitS3RdmaClient();
 		void initHDFS();
 		void uninitHDFS();
 		void initNetBench();
@@ -239,6 +247,25 @@ class LocalWorker : public Worker
         void s3ModeIterateAndCompleteMpuIDs();
 #ifdef S3_SUPPORT
 		std::shared_ptr<Aws::IOStream> makeS3UploadBodyStream(unsigned char* buf, size_t len);
+
+		void* getS3RdmaBuf(size_t index);
+		void s3RdmaUpload(void* buf, size_t len, const S3RdmaIOFunc& ioFunc,
+			const std::string& bucketName, const std::string& objectName);
+		void s3RdmaDownload(void* buf, size_t len, const S3RdmaIOFunc& ioFunc,
+			const std::string& bucketName, const std::string& objectName);
+		void s3RdmaCheckReply(size_t len,
+			const std::string& bucketName, const std::string& objectName);
+
+		/**
+		 * Add the RDMA headers which propose out-of-band transfer for this request. The agent
+		 * header tells the server which library produced the token, i.e. how to parse it.
+		 */
+		template <typename REQUESTTYPE>
+		static void s3RdmaSetRequestHeaders(REQUESTTYPE& request, const char* descStr)
+		{
+			request.SetAdditionalCustomHeaderValue(S3RDMA_HEADER_AGENT, S3RDMA_AGENT_CUOBJ);
+			request.SetAdditionalCustomHeaderValue(S3RDMA_HEADER_TOKEN, descStr);
+		}
 #endif
 
 #ifdef S3_SUPPORT

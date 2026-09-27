@@ -475,6 +475,7 @@ void LocalWorker::preparePhase()
 
     initLibAio();
     initS3Client();
+    initS3RdmaClient();
     initHDFS();
     initNetBench();
 
@@ -622,6 +623,84 @@ void LocalWorker::uninitS3Client()
 	// s3Client is a std::shared_ptr, so reset() will cleanup the client object
 	// (note: this could also be the shared singleton s3 client from ProgArgs)
 	s3Client.reset();
+
+#endif // S3_SUPPORT
+}
+
+/**
+ * Get the shared cuObject client and register this worker's IO buffers for RDMA. This needs to
+ * run after allocIOBuffer() and allocGPUIOBuffer().
+ *
+ * @throw WorkerException on error.
+ */
+void LocalWorker::initS3RdmaClient()
+{
+#ifdef S3_SUPPORT
+
+	if( (progArgs->getBenchMode() != BenchMode_S3) || !progArgs->getUseS3Rdma() )
+		return; // nothing to do
+
+	useS3Rdma = true;
+
+	try
+	{
+		s3RdmaClient = &S3RdmaClient::getInstance();
+
+		/* Register only the buffer the transfer will use. With no GPU, gpuIOBufVec holds NULL
+			placeholders for the no-op CUDA paths; cuMemObjGetDescriptor rejects a null pointer.
+			With GPUs, the device buffer is the RDMA target and the host buffer is not. */
+		const bool areGPUsGiven = !progArgs->getGPUIDsVec().empty();
+		BufferVec& rdmaBufVec = areGPUsGiven ? gpuIOBufVec : ioBufVec;
+
+		for(char* buf : rdmaBufVec)
+		{
+			if(!buf)
+				continue;
+
+			s3RdmaClient->registerBuf(buf, progArgs->getBlockSize() );
+			s3RdmaRegisteredBufVec.push_back(buf);
+		}
+	}
+	catch(const std::exception& e)
+	{
+		throw WorkerException(std::string("S3 RDMA client init failed. ") + e.what() );
+	}
+
+	/* the cuObject lib splits a transfer into multiple callbacks if the registered memory can't be
+		transferred in one go; each callback would be a separate S3 request, which would not match
+		the object/part boundaries, so refuse instead of silently producing wrong objects */
+	void* firstBuf = getS3RdmaBuf(0);
+	const size_t maxRequestSize = s3RdmaClient->getMaxRequestSize(firstBuf);
+
+	if(maxRequestSize < progArgs->getBlockSize() )
+		throw WorkerException("S3 RDMA max request callback size is smaller than the block size. "
+			"Block size: " + std::to_string(progArgs->getBlockSize() ) + "; "
+			"Max request callback size: " + std::to_string(maxRequestSize) );
+
+	LOGGER(Log_DEBUG, "S3 RDMA client ready. "
+		"Rank: " << workerRank << "; "
+		"Memory type: " << s3RdmaClient->getMemoryTypeStr(firstBuf) << "; "
+		"Max request size: " << maxRequestSize << std::endl);
+
+#endif // S3_SUPPORT
+}
+
+/**
+ * Deregister this worker's RDMA buffers and release its reference to the shared client.
+ * This needs to run before the IO buffers themselves are freed.
+ */
+void LocalWorker::uninitS3RdmaClient()
+{
+#ifdef S3_SUPPORT
+
+	if(!s3RdmaClient)
+		return; // nothing to do
+
+	for(char* buf : s3RdmaRegisteredBufVec)
+		s3RdmaClient->deregisterBuf(buf);
+
+	s3RdmaRegisteredBufVec.clear();
+	s3RdmaClient = NULL; // singleton, not owned
 
 #endif // S3_SUPPORT
 }
@@ -1655,6 +1734,7 @@ void LocalWorker::cleanup()
 
 	uninitNetBench();
 	uninitHDFS();
+	uninitS3RdmaClient(); // before the buffers below get freed
 	uninitS3Client();
     uninitLibAio();
 
@@ -4868,6 +4948,110 @@ std::shared_ptr<Aws::IOStream> LocalWorker::makeS3UploadBodyStream(unsigned char
 
 	return std::make_shared<S3MemoryStream>(buf, len);
 }
+
+/**
+ * Get the buffer to use as RDMA source/destination. This is the GPU buffer if the user selected
+ * GPUs (so that the data really moves between GPU memory and the S3 server), otherwise the host
+ * buffer.
+ */
+void* LocalWorker::getS3RdmaBuf(size_t index)
+{
+	if(!gpuIOBufVec.empty() && gpuIOBufVec[index] )
+		return gpuIOBufVec[index];
+
+	return ioBufVec[index];
+}
+
+/**
+ * Check the "x-amz-rdma-reply" of the last S3 request sent by this thread to confirm that the
+ * server really moved the data out-of-band.
+ *
+ * RDMA is negotiated per request and there is no handshake: a server which doesn't implement the
+ * protocol just ignores our token and uses the HTTP body, which for an upload means it silently
+ * stored an empty object. So a missing or non-2xx reply has to be treated as a hard error, or the
+ * benchmark would report throughput for data that never moved.
+ *
+ * @throw WorkerException if the server did not use the RDMA path.
+ */
+void LocalWorker::s3RdmaCheckReply(size_t len, const std::string& bucketName,
+	const std::string& objectName)
+{
+#ifdef S3RDMA_SUPPORT
+
+	const S3RdmaReply& reply = S3RdmaMonitor::getThreadReply();
+
+	IF_UNLIKELY(!reply.hasReply)
+		throw WorkerException("S3 server did not send an \"" S3RDMA_HEADER_REPLY "\" header, so "
+			"it does not support the S3 RDMA protocol and transferred no data. "
+			"Endpoint: " + s3EndpointStr + "; "
+			"Object: " + bucketName + "/" + objectName);
+
+	IF_UNLIKELY(reply.isRdmaDeclined() )
+		throw WorkerException(std::string("S3 server declined the RDMA transfer") +
+			( (reply.statusCode == 501) ? " (501: not supported)" : "") + ". "
+			"Check that the server has RDMA enabled and that its RDMA interface is reachable. "
+			"Endpoint: " + s3EndpointStr + "; "
+			"Object: " + bucketName + "/" + objectName + "; "
+			S3RDMA_HEADER_REPLY ": " + std::to_string(reply.statusCode) );
+
+	/* the byte count is only mandated for GET, so only verify it when the server sent it. */
+	IF_UNLIKELY(reply.hasNumBytes && (reply.numBytes != len) )
+		throw WorkerException("S3 server transferred an unexpected number of bytes via RDMA. "
+			"Endpoint: " + s3EndpointStr + "; "
+			"Object: " + bucketName + "/" + objectName + "; "
+			"Expected bytes: " + std::to_string(len) + "; "
+			"Transferred bytes: " + std::to_string(reply.numBytes) );
+
+#endif // S3RDMA_SUPPORT
+}
+
+/**
+ * Run an RDMA upload via the cuObject client. ioFunc sends the corresponding S3 request.
+ *
+ * @throw WorkerException on error.
+ */
+void LocalWorker::s3RdmaUpload(void* buf, size_t len, const S3RdmaIOFunc& ioFunc,
+	const std::string& bucketName, const std::string& objectName)
+{
+#ifdef S3RDMA_SUPPORT
+	S3RdmaMonitor::resetThreadReply(); // so that a failed request can't read a stale reply
+#endif
+
+	const ssize_t rdmaRes = s3RdmaClient->put(ioFunc, buf, len);
+
+	checkInterruptionRequest(); // (placed here to avoid error check on interruption)
+
+	IF_UNLIKELY(rdmaRes < 0 || ( (size_t)rdmaRes != len) )
+		throw WorkerException("S3 RDMA upload failed. "
+			"Endpoint: " + s3EndpointStr + "; "
+			"Object: " + bucketName + "/" + objectName + "; "
+			"Expected bytes: " + std::to_string(len) + "; "
+			"Transferred bytes: " + std::to_string(rdmaRes) );
+}
+
+/**
+ * Run an RDMA download via the cuObject client. ioFunc sends the corresponding S3 request.
+ *
+ * @throw WorkerException on error.
+ */
+void LocalWorker::s3RdmaDownload(void* buf, size_t len, const S3RdmaIOFunc& ioFunc,
+	const std::string& bucketName, const std::string& objectName)
+{
+#ifdef S3RDMA_SUPPORT
+	S3RdmaMonitor::resetThreadReply(); // so that a failed request can't read a stale reply
+#endif
+
+	const ssize_t rdmaRes = s3RdmaClient->get(ioFunc, buf, len);
+
+	checkInterruptionRequest(); // (placed here to avoid error check on interruption)
+
+	IF_UNLIKELY(rdmaRes < 0 || ( (size_t)rdmaRes != len) )
+		throw WorkerException("S3 RDMA download failed. "
+			"Endpoint: " + s3EndpointStr + "; "
+			"Object: " + bucketName + "/" + objectName + "; "
+			"Expected bytes: " + std::to_string(len) + "; "
+			"Transferred bytes: " + std::to_string(rdmaRes) );
+}
 #endif // S3_SUPPORT
 
 /**
@@ -4892,11 +5076,13 @@ void LocalWorker::s3ModeUploadObjectSinglePart(std::string bucketName, std::stri
 
     if(blockSize)
     {
-        s3MemStream = makeS3UploadBodyStream(
-            (unsigned char*) (blockSize ? ioBufVec[0] : NULL), blockSize);
+        if(!useS3Rdma)
+            s3MemStream = makeS3UploadBodyStream(
+                (unsigned char*) (blockSize ? ioBufVec[0] : NULL), blockSize);
 
-		// mid-transfer shaping paces inside the stream; avoid double-counting the whole part
-		if(!useS3UploadStreamRateLimit)
+		/* mid-transfer shaping paces inside the stream; avoid double-counting the whole part.
+			(RDMA has no body stream to pace, so it always takes the pre-op wait.) */
+		if(!useS3UploadStreamRateLimit || useS3Rdma)
 			((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
     }
 
@@ -4911,9 +5097,9 @@ void LocalWorker::s3ModeUploadObjectSinglePart(std::string bucketName, std::stri
 	S3::PutObjectRequest request;
 	request.WithBucket(bucketName)
 		.WithKey(objectName)
-		.WithContentLength(blockSize);
+		.WithContentLength(useS3Rdma ? 0 : blockSize); // RDMA payload doesn't go through the body
 
-    if(blockSize)
+    if(blockSize && !useS3Rdma)
         request.SetBody(s3MemStream);
 
     if(doS3AclPutInline)
@@ -4936,7 +5122,32 @@ void LocalWorker::s3ModeUploadObjectSinglePart(std::string bucketName, std::stri
 
 	OPLOG_PRE_OP("S3PutObject", bucketName + "/" + objectName, currentOffset, blockSize);
 
-	S3::PutObjectOutcome outcome = s3Client->PutObject(request);
+	S3::PutObjectOutcome outcome;
+
+	if(!useS3Rdma || !blockSize)
+		outcome = s3Client->PutObject(request);
+	else
+	{
+		s3RdmaUpload(getS3RdmaBuf(0), blockSize,
+			[&](const char* descStr, size_t size, loff_t offset) -> ssize_t
+			{
+				s3RdmaSetRequestHeaders(request, descStr);
+
+				outcome = s3Client->PutObject(request);
+
+				/* note: don't fail the RDMA op on S3 errors, so that the regular outcome error
+					handling below runs (which also honors --s3ignoreerrors) */
+				IF_UNLIKELY(!outcome.IsSuccess() )
+					return size;
+
+				atomicLiveOps.numBytesDone += size; // no body, so no DataSentEventHandler for this
+
+				return size;
+			}, bucketName, objectName);
+
+		if(outcome.IsSuccess() && !ignoreS3Errors)
+			s3RdmaCheckReply(blockSize, bucketName, objectName);
+	}
 
 	OPLOG_POST_OP("S3PutObject", bucketName + "/" + objectName, currentOffset, blockSize,
 		!outcome.IsSuccess() );
@@ -5052,11 +5263,14 @@ void LocalWorker::s3ModeUploadObjectMultiPart(std::string bucketName, std::strin
         /* note: streamBuf (member of S3MemoryStream) needs to be initialized in loop to
             have the exact remaining blockSize as len. otherwise the AWS SDK will send full
             streamBuf len despite smaller contentLength in UploadPartRequest. */
-        std::shared_ptr<Aws::IOStream> s3MemStream = makeS3UploadBodyStream(
-            (unsigned char*) ioBufVec[0], blockSize);
+        std::shared_ptr<Aws::IOStream> s3MemStream;
 
-		if(!useS3UploadStreamRateLimit)
-			((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
+        if(!useS3Rdma)
+            s3MemStream = makeS3UploadBodyStream( (unsigned char*) ioBufVec[0], blockSize);
+
+		/* (RDMA has no body stream to pace, so it always takes the pre-op wait.) */
+        if(!useS3UploadStreamRateLimit || useS3Rdma)
+            ((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
 
 		std::chrono::steady_clock::time_point ioStartT = std::chrono::steady_clock::now();
 
@@ -5071,7 +5285,8 @@ void LocalWorker::s3ModeUploadObjectMultiPart(std::string bucketName, std::strin
 			.WithKey(objectName)
 			.WithUploadId(uploadID)
 			.WithPartNumber(currentPartNum)
-			.WithContentLength(blockSize);
+			// RDMA payload doesn't go through the body
+			.WithContentLength(useS3Rdma ? 0 : blockSize);
 
         // (no s3ModeAddServerSideEncryptionHeaders() because this one is only for SSE-C)
         if(!s3SSECKey.empty() )
@@ -5083,7 +5298,8 @@ void LocalWorker::s3ModeUploadObjectMultiPart(std::string bucketName, std::strin
             S3Tk::addUploadPartRequestChecksum(uploadPartRequest, &completedPart,
                 s3ChecksumAlgorithm, (unsigned char*) ioBufVec[0], blockSize);
 
-		uploadPartRequest.SetBody(s3MemStream);
+		if(!useS3Rdma)
+			uploadPartRequest.SetBody(s3MemStream);
 
 		uploadPartRequest.SetDataSentEventHandler(
 			[&](const Aws::Http::HttpRequest* request, long long numBytes)
@@ -5096,7 +5312,43 @@ void LocalWorker::s3ModeUploadObjectMultiPart(std::string bucketName, std::strin
 
 		OPLOG_PRE_OP("S3UploadPart", bucketName + "/" + objectName, currentOffset, blockSize);
 
-		auto uploadPartOutcome = s3Client->UploadPart(uploadPartRequest);
+		S3::UploadPartOutcome uploadPartOutcome;
+
+		if(!useS3Rdma)
+			uploadPartOutcome = s3Client->UploadPart(uploadPartRequest);
+		else
+		{
+			try
+			{
+				s3RdmaUpload(getS3RdmaBuf(0), blockSize,
+					[&](const char* descStr, size_t size, loff_t offset) -> ssize_t
+					{
+						s3RdmaSetRequestHeaders(uploadPartRequest, descStr);
+
+						uploadPartOutcome = s3Client->UploadPart(uploadPartRequest);
+
+						/* note: don't fail the RDMA op on S3 errors, so that the regular outcome
+							error handling below runs (which also aborts the multipart upload) */
+						IF_UNLIKELY(!uploadPartOutcome.IsSuccess() )
+							return size;
+
+						atomicLiveOps.numBytesDone += size; // no body, so no DataSentEventHandler
+
+						return size;
+					}, bucketName, objectName);
+
+				if(uploadPartOutcome.IsSuccess() && !ignoreS3Errors)
+					s3RdmaCheckReply(blockSize, bucketName, objectName);
+			}
+			catch(...)
+			{
+				/* RDMA errors and interruption can bypass the outcome handling below.
+					Abort the unfinished upload without replacing the original exception. */
+				try { s3ModeAbortMultipartUpload(bucketName, objectName, uploadID); }
+				catch(...) {}
+				throw;
+			}
+		}
 
 		/* note: there is no way to tell the server about the offset of a part within an object, so
 			concurrent part uploads might add overhead on completion for the S3 server to assemble
@@ -5562,11 +5814,14 @@ void LocalWorker::s3ModeUploadObjectMultiPartShared(std::string bucketName, std:
         /* note: streamBuf (member of S3MemoryStream) needs to be initialized in loop to
             have the exact remaining blockSize as len. otherwise the AWS SDK will send full
             streamBuf len despite smaller contentLength in UploadPartRequest. */
-        std::shared_ptr<Aws::IOStream> s3MemStream = makeS3UploadBodyStream(
-            (unsigned char*) ioBufVec[0], blockSize);
+        std::shared_ptr<Aws::IOStream> s3MemStream;
 
-		if(!useS3UploadStreamRateLimit)
-			((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
+        if(!useS3Rdma)
+            s3MemStream = makeS3UploadBodyStream( (unsigned char*) ioBufVec[0], blockSize);
+
+		/* (RDMA has no body stream to pace, so it always takes the pre-op wait.) */
+        if(!useS3UploadStreamRateLimit || useS3Rdma)
+            ((*this).*funcRWRateLimiter)(blockSize, isInterruptionRequested);
 
 		std::chrono::steady_clock::time_point ioStartT = std::chrono::steady_clock::now();
 
@@ -5581,13 +5836,15 @@ void LocalWorker::s3ModeUploadObjectMultiPartShared(std::string bucketName, std:
 			.WithKey(objectName)
 			.WithUploadId(uploadID)
 			.WithPartNumber(currentPartNum)
-			.WithContentLength(blockSize);
+			// RDMA payload doesn't go through the body
+			.WithContentLength(useS3Rdma ? 0 : blockSize);
 
         IF_UNLIKELY(s3ChecksumAlgorithm != S3ChecksumAlgorithm::NOT_SET)
             S3Tk::addUploadPartRequestChecksum(uploadPartRequest, &completedPart,
                 s3ChecksumAlgorithm, (unsigned char*) ioBufVec[0], blockSize);
 
-		uploadPartRequest.SetBody(s3MemStream);
+		if(!useS3Rdma)
+			uploadPartRequest.SetBody(s3MemStream);
 
 		uploadPartRequest.SetDataSentEventHandler(
 			[&](const Aws::Http::HttpRequest* request, long long numBytes)
@@ -5600,7 +5857,32 @@ void LocalWorker::s3ModeUploadObjectMultiPartShared(std::string bucketName, std:
 
 		OPLOG_PRE_OP("S3UploadPart", bucketName + "/" + objectName, currentOffset, blockSize);
 
-		auto uploadPartOutcome = s3Client->UploadPart(uploadPartRequest);
+		S3::UploadPartOutcome uploadPartOutcome;
+
+		if(!useS3Rdma)
+			uploadPartOutcome = s3Client->UploadPart(uploadPartRequest);
+		else
+		{
+			s3RdmaUpload(getS3RdmaBuf(0), blockSize,
+				[&](const char* descStr, size_t size, loff_t offset) -> ssize_t
+				{
+					s3RdmaSetRequestHeaders(uploadPartRequest, descStr);
+
+					uploadPartOutcome = s3Client->UploadPart(uploadPartRequest);
+
+					/* note: don't fail the RDMA op on S3 errors, so that the regular outcome
+						error handling below runs (which also aborts the multipart upload) */
+					IF_UNLIKELY(!uploadPartOutcome.IsSuccess() )
+						return size;
+
+					atomicLiveOps.numBytesDone += size; // no body, so no DataSentEventHandler
+
+					return size;
+				}, bucketName, objectName);
+
+			if(uploadPartOutcome.IsSuccess() && !progArgs->getIgnoreS3Errors() )
+				s3RdmaCheckReply(blockSize, bucketName, objectName);
+		}
 
 		OPLOG_POST_OP("S3UploadPart", bucketName + "/" + objectName, currentOffset, blockSize,
 			!uploadPartOutcome.IsSuccess() );
@@ -6257,7 +6539,7 @@ void LocalWorker::s3ModeDownloadObject(std::string bucketName, std::string objec
                     .WithSSECustomerKey(s3SSECKey)
                     .WithSSECustomerKeyMD5(s3SSECKeyMD5);
 
-        if(!useS3FastRead)
+        if(!useS3FastRead && !useS3Rdma)
             request.SetResponseStreamFactory([&]()
             { /* note: this lambda will be called async after additional for-loop passes, so
                 we can't rely on stack values from current loop pass to exist and thus need
@@ -6283,6 +6565,11 @@ void LocalWorker::s3ModeDownloadObject(std::string bucketName, std::string objec
 			[&](const Aws::Http::HttpRequest* request, Aws::Http::HttpResponse* response,
 			long long numBytes)
 			{
+				/* in RDMA mode the body is empty and the bytes are accounted for in the RDMA
+					callback instead, so anything arriving here is not our object data. */
+				if(useS3Rdma)
+					return;
+
 				if(isRWMixedReader)
 					atomicLiveOpsReadMix.numBytesDone += numBytes;
 				else
@@ -6296,7 +6583,30 @@ void LocalWorker::s3ModeDownloadObject(std::string bucketName, std::string objec
 
 		OPLOG_PRE_OP("S3GetObject", bucketName + "/" + objectName, currentOffset, blockSize);
 
-		S3::GetObjectOutcome outcome = s3Client->GetObject(request);
+		S3::GetObjectOutcome outcome;
+
+		if(!useS3Rdma)
+			outcome = s3Client->GetObject(request);
+		else
+			s3RdmaDownload(getS3RdmaBuf(0), blockSize,
+				[&](const char* descStr, size_t size, loff_t offset) -> ssize_t
+				{
+					s3RdmaSetRequestHeaders(request, descStr);
+
+					outcome = s3Client->GetObject(request);
+
+					/* note: don't fail the RDMA op on S3 errors, so that the regular outcome error
+						handling below runs (which also honors --s3ignoreerrors) */
+					IF_UNLIKELY(!outcome.IsSuccess() )
+						return size;
+
+					if(isRWMixedReader)
+						atomicLiveOpsReadMix.numBytesDone += size;
+					else
+						atomicLiveOps.numBytesDone += size;
+
+					return size;
+				}, bucketName, objectName);
 
 		OPLOG_POST_OP("S3GetObject", bucketName + "/" + objectName, currentOffset, blockSize,
 		    !outcome.IsSuccess() );
@@ -6306,7 +6616,13 @@ void LocalWorker::s3ModeDownloadObject(std::string bucketName, std::string objec
 		IF_UNLIKELY(!outcome.IsSuccess() && !ignoreS3Errors)
             s3ModeThrowOnError(outcome, "Object download failed.", bucketName, objectName);
 
-		IF_UNLIKELY( ( (size_t)outcome.GetResult().GetContentLength() < blockSize) &&
+		/* a server which declined RDMA sends the data as normal http body instead, so the data
+			did not land in our registered buffer. */
+		if(useS3Rdma && outcome.IsSuccess() && !ignoreS3Errors)
+			s3RdmaCheckReply(blockSize, bucketName, objectName);
+
+		IF_UNLIKELY( !useS3Rdma &&
+			( (size_t)outcome.GetResult().GetContentLength() < blockSize) &&
             !ignoreS3Errors)
 		{
             throw WorkerException(std::string("Object too small. ") +

@@ -188,6 +188,10 @@ namespace bpt = boost::property_tree;
 #define ARG_S3OBJTAG_LONG                "s3otag"
 #define ARG_S3OBJTAGVERIFY_LONG          "s3otagverify"
 #define ARG_S3RANDOBJ_LONG               "s3randobj"
+#define ARG_S3RDMA_LONG                  "s3rdma"
+#define ARG_RDMA_LONG                    "rdma" // short alias for ARG_S3RDMA_LONG (as in s3perf)
+#define ARG_CUDA_LONG                    "cuda" // shorthand for "--gpuids 0" (as in s3perf)
+#define ARG_S3RDMABUFSIZE_LONG           "s3rdmabufsize"
 #define ARG_S3REGION_LONG                "s3region"
 #define ARG_S3SESSION_TOKEN_LONG         "s3sessiontoken"
 #define ARG_S3SIGNPAYLOAD_LONG           "s3sign"
@@ -383,6 +387,8 @@ class ProgArgs
         BenchMode benchMode; // current benchmark mode (posix, s3, hdfs, netbench)
         size_t blockSize; // number of bytes to read/write in a single read()/write() call
         std::string blockSizeOrigStr; // original blockSize str from user with unit
+        size_t s3RdmaBufSize; // assumed RDMA buffer size of the S3 server (for client-side check)
+        std::string s3RdmaBufSizeOrigStr; // original s3RdmaBufSize str from user with unit
         unsigned blockVariancePercent; // % of blocks that should differ between writes
         std::string blockVarianceAlgo; // rand algo for buffer fill variance
         std::string clientsFilePath; // path to file for appended service hosts
@@ -585,6 +591,9 @@ class ProgArgs
         bool useS3MPUSharing; // use s3 shared mpu mode from multiple clients
         bool useS3ObjectPrefixRand; // implicit based on RAND_PREFIX_MARKS_SUBSTR in s3ObjectPrefix
         bool useS3RandObjSelect; // random object selection for each read
+        bool useS3Rdma; // transfer S3 object data out-of-band via RDMA (NVIDIA cuObject)
+        bool useRdmaAlias; // "--rdma" was given; folded into useS3Rdma after parsing
+        bool useCudaAlias; // "--cuda" was given; folded into gpuIDsStr after parsing
         bool useS3FastRead; /* get objects to /dev/null instead of buffer (i.e. no post processing
                                 via buffer possible, such as GPU copy or data verification) */
         bool useS3SSE; // use SSE-S3 encryption method for S3
@@ -857,6 +866,8 @@ class ProgArgs
         bool getUseS3MPUSharing() const { return useS3MPUSharing; }
         bool getUseS3ObjectPrefixRand() const { return useS3ObjectPrefixRand; }
         bool getUseS3RandObjSelect() const { return useS3RandObjSelect; }
+        bool getUseS3Rdma() const { return useS3Rdma; }
+        size_t getS3RdmaBufSize() const { return s3RdmaBufSize; }
         bool getUseS3SSE() const { return useS3SSE; }
         bool getUseS3VirtualAddressing() const { return useS3VirtualAddressing; }
         bool getUseStridedAccess() const { return useStridedAccess; }
